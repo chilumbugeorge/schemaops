@@ -2,7 +2,10 @@
 
 Every schema change runs without blocking traffic:
 
-* ALTER TABLE and index changes go through pt-online-schema-change, always.
+* ALTER TABLE and index changes are first attempted as instant DDL (ALGORITHM=INSTANT), a
+  metadata-only change that finishes in milliseconds whatever the table size. If the server
+  says the change cannot be instant, it goes through pt-online-schema-change instead. A
+  blocking table copy by the server itself is never used.
 * CREATE / DROP / RENAME TABLE run directly with a short lock_wait_timeout, so a
   blocked metadata lock gives up instead of queueing every other query behind it.
 * Changes to protected (hot or large) tables in a manual environment, and new
@@ -38,6 +41,8 @@ logger = log.get("deploy")
 
 HISTORY_TABLE = "_schemaops_history"
 DONE = ("success", "baseline", "manual")
+# ER_UNKNOWN_ALTER_ALGORITHM, ER_ALTER_OPERATION_NOT_SUPPORTED, ER_ALTER_OPERATION_NOT_SUPPORTED_REASON
+NOT_INSTANT_ERRORS = (1800, 1845, 1846)
 HISTORY_DDL = f"""
 CREATE TABLE IF NOT EXISTS `{HISTORY_TABLE}` (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -104,8 +109,9 @@ class Target(Protocol):
     def inspect(self, table: str) -> TableFacts: ...
     def server_facts(self) -> ServerFacts: ...
     def start(self, migration: Migration, method: str) -> None: ...
-    def finish(self, migration: Migration, status: str, error: str = "") -> None: ...
+    def finish(self, migration: Migration, status: str, error: str = "", method: str = "") -> None: ...
     def execute(self, sql: str) -> None: ...
+    def instant_alter(self, table: str, alter: str) -> bool: ...
     def online_alter(self, table: str, alter: str) -> None: ...
     def close(self) -> None: ...
 
@@ -225,12 +231,28 @@ class MariaDBTarget:
             (migration.name, migration.sha256, method, actor[:128], os.environ.get("CI_PIPELINE_URL", "")[:255]),
         )
 
-    def finish(self, migration: Migration, status: str, error: str = "") -> None:
+    def finish(self, migration: Migration, status: str, error: str = "", method: str = "") -> None:
         self._query(
-            f"UPDATE `{HISTORY_TABLE}` SET status = %s, error_message = %s, finished_at = UTC_TIMESTAMP() "
-            "WHERE migration = %s",
-            (status, log.redact(error)[:2000], migration.name),
+            f"UPDATE `{HISTORY_TABLE}` SET status = %s, error_message = %s, method = IF(%s = '', method, %s), "
+            "finished_at = UTC_TIMESTAMP() WHERE migration = %s",
+            (status, log.redact(error)[:2000], method, method, migration.name),
         )
+
+    def instant_alter(self, table: str, alter: str) -> bool:
+        """Try the change as instant DDL. False means the server cannot do it instantly."""
+        import pymysql
+
+        quoted = "`" + table.replace("`", "``") + "`"
+        self._query(f"SET SESSION lock_wait_timeout = {int(self.online.lock_wait_timeout)}")
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(f"ALTER TABLE {quoted} {alter}, ALGORITHM=INSTANT")
+            return True
+        except pymysql.MySQLError as exc:
+            if exc.args and exc.args[0] in NOT_INSTANT_ERRORS:
+                logger.info("instant DDL not possible", extra={"table": table, "reason": log.redact(str(exc.args[-1]))})
+                return False
+            raise DeployError(f"{self.schema} ({self.config.environment.upper()}): {log.redact(str(exc))}") from exc
 
     def execute(self, sql: str) -> None:
         self._query(f"SET SESSION lock_wait_timeout = {int(self.online.lock_wait_timeout)}")
@@ -273,9 +295,10 @@ class MariaDBTarget:
 @dataclass(frozen=True)
 class Step:
     migration: Migration
-    method: str  # direct | pt-osc | baseline | manual
+    method: str  # direct | online | baseline | manual ("online": instant DDL, else pt-online-schema-change)
     detail: str = ""
     problems: tuple[str, ...] = ()  # pre-flight failures; the step will not run while any remain
+    copy_problems: tuple[str, ...] = ()  # failures that matter only if the table has to be copied
 
 
 def oversized(settings: Settings, facts: TableFacts) -> str:
@@ -299,10 +322,11 @@ def preflight(
 
     `created` names tables an earlier pending migration will create (used when planning).
     """
-    if step.method not in ("direct", "pt-osc") or step.migration.is_initial_dump:
+    if step.method not in ("direct", "online") or step.migration.is_initial_dump:
         return step
     (operation,) = sqlplan.parse_operations(step.migration.read())
     problems: list[str] = []
+    copy_problems: list[str] = []  # only pt-online-schema-change cares about these
     notes: list[str] = []
     limit = settings.max_transaction_seconds
     if limit and (server.oldest_transaction_seconds or 0) > limit:
@@ -333,17 +357,19 @@ def preflight(
         if operation.kind != sqlplan.ALTER_TABLE:
             continue
         if facts.triggers:
-            problems.append(f"`{table}` has {facts.triggers} trigger(s); pt-online-schema-change cannot run on it")
+            copy_problems.append(f"`{table}` has {facts.triggers} trigger(s); pt-online-schema-change cannot run on it")
         if facts.referenced_by:
-            problems.append(f"`{table}` is referenced by {facts.referenced_by} foreign key(s) in other tables; a DBA must apply this change")
+            copy_problems.append(f"`{table}` is referenced by {facts.referenced_by} foreign key(s) in other tables; a DBA must apply this change")
         needed = int(facts.size_bytes * settings.disk_headroom)
         if settings.disk_headroom and server.free_bytes is not None and server.free_bytes < needed:
-            problems.append(
+            copy_problems.append(
                 f"not enough free disk space to copy `{table}`: {format_size(server.free_bytes)} free, "
                 f"{format_size(needed)} needed"
             )
     detail = f"{step.detail} ({'; '.join(notes)})" if notes else step.detail
-    return replace(step, detail=detail, problems=tuple(problems))
+    if not settings.online_change.prefer_instant:
+        problems, copy_problems = problems + copy_problems, []  # the table will certainly be copied
+    return replace(step, detail=detail, problems=tuple(problems), copy_problems=tuple(copy_problems))
 
 
 def _manual_reasons(
@@ -405,7 +431,8 @@ def pending_steps(
         if reasons:
             steps.append(Step(migration, "manual", "; ".join(reasons)))
         elif operations[0].kind == sqlplan.ALTER_TABLE:
-            steps.append(Step(migration, "pt-osc", f"ALTER `{operations[0].table}`"))
+            how = "instant DDL, else pt-online-schema-change" if settings.online_change.prefer_instant else "pt-online-schema-change"
+            steps.append(Step(migration, "online", f"ALTER `{operations[0].table}`, {how}"))
         else:
             steps.append(Step(migration, "direct", operations[0].kind.replace("_", " ")))
     return steps
@@ -486,21 +513,33 @@ def deploy(
             )
         logger.info("applying migration", extra=context)
         target.start(migration, step.method)
+        used = step.method
         try:
             if step.method == "baseline":
                 pass  # the schema already exists; record the dump as its starting point
             else:
                 for operation in sqlplan.parse_operations(migration.read()):
-                    if operation.kind == sqlplan.ALTER_TABLE:
-                        target.online_alter(operation.table, operation.alter)
-                    else:
+                    if operation.kind != sqlplan.ALTER_TABLE:
                         target.execute(operation.sql)
+                        continue
+                    table = operation.name or operation.table
+                    if settings.online_change.prefer_instant and target.instant_alter(table, operation.alter):
+                        used = "instant"
+                        continue
+                    if step.copy_problems:
+                        raise DeployError(
+                            f"{schema.label} ({environment.upper()}): `{migration.name}` cannot run as instant DDL and "
+                            "pre-flight checks rule out copying the table; nothing was changed:\n"
+                            + "\n".join(f"  - {problem}" for problem in step.copy_problems)
+                        )
+                    target.online_alter(table, operation.alter)
+                    used = "pt-osc"
         except Exception as exc:
             target.finish(migration, "failed", str(exc))
             logger.error("migration failed", extra=context)
             raise
-        target.finish(migration, "baseline" if step.method == "baseline" else "success")
-        logger.info("migration applied", extra=context)
+        target.finish(migration, "baseline" if step.method == "baseline" else "success", method=used)
+        logger.info("migration applied", extra={**context, "method": used})
     return steps
 
 

@@ -10,6 +10,13 @@ def test_alter_keeps_the_original_specification_for_pt_osc():
     assert (op.kind, op.table) == (sqlplan.ALTER_TABLE, "users")
     assert op.alter == "ADD COLUMN note VARCHAR(10) DEFAULT 'a, b' NULL,\n  ADD INDEX idx_note (note)"
     assert not op.adds_unique_index
+    assert op.name == "Users"  # executed exactly as written
+
+
+def test_author_supplied_algorithm_and_lock_clauses_are_dropped():
+    (op,) = ops("ALTER TABLE t ADD COLUMN a BIGINT NULL, ALGORITHM=INPLACE, LOCK = NONE, ADD COLUMN b BIGINT NULL;")
+    assert op.alter == "ADD COLUMN a BIGINT NULL, ADD COLUMN b BIGINT NULL"
+    assert ops("ALTER TABLE t ALGORITHM=INPLACE;")[0].kind == sqlplan.UNSUPPORTED
 
 
 def test_index_statements_become_alter_specifications():

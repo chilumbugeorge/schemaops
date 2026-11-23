@@ -239,6 +239,8 @@ def cmd_deploy(settings: Settings, args: argparse.Namespace) -> int:
                 _out(f"  {step.migration.name}  [{step.method}] {step.detail}")
                 for problem in step.problems:
                     _out(f"      PRE-FLIGHT: {problem}")
+                for problem in step.copy_problems:
+                    _out(f"      PRE-FLIGHT (only if instant DDL is not possible): {problem}")
         except ManualActionRequired as exc:
             _out(str(exc))
             exit_code = max(exit_code, exc.exit_code)

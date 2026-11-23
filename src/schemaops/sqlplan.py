@@ -43,6 +43,7 @@ ALTER_NOT_ONLINE_RE = re.compile(
     r"(?:discard|import)\s+tablespace\b|partition\s+by\b)",
     re.IGNORECASE,
 )
+ALGORITHM_CLAUSE_RE = re.compile(r"^(?:algorithm|lock)\s*=?\s*\w+$", re.IGNORECASE)
 ADD_UNIQUE_RE = re.compile(
     r"^add\s+(?:constraint\s+\S*\s*)?unique\b|^add\s+(?:column\s+)?.*\bunique\b", re.IGNORECASE | re.DOTALL
 )
@@ -60,6 +61,7 @@ class Operation:
     qualified: bool = False  # the statement names a schema explicitly (db.table)
     adds_unique_index: bool = False
     reason: str = ""  # why an operation is unsupported
+    name: str = ""  # the table name exactly as written (ALTER only), for execution
 
     @property
     def table(self) -> str:
@@ -70,6 +72,12 @@ def _is_qualified(name: str) -> bool:
     return len(re.findall(IDENT, name)) > 1
 
 
+def _as_written(name: str) -> str:
+    """The last part of a possibly qualified, possibly quoted identifier, case preserved."""
+    quoted, bare = re.findall(r"`((?:[^`]|``)+)`|([\w$]+)", name)[-1]
+    return quoted.replace("``", "`") if quoted else bare
+
+
 def _original(sql: str, statement: Statement) -> str:
     return sql[statement.offset : statement.end]
 
@@ -78,13 +86,21 @@ def _alter_operation(sql: str, masked: str, statement: Statement, line: int) -> 
     match = ALTER_TABLE_RE.match(statement.text)
     assert match is not None
     name = match.group("name")
-    specs = [spec.strip() for _offset, spec in split_top_level(statement.text[match.end() :]) if spec.strip()]
-    alter = _original(sql, statement)[match.end() :].strip()
+    original = _original(sql, statement)
+    # schemaops chooses the algorithm and lock level itself, so drop any the author wrote.
+    pieces = [
+        (offset, spec)
+        for offset, spec in split_top_level(statement.text[match.end() :])
+        if spec.strip() and not ALGORITHM_CLAUSE_RE.match(spec.strip())
+    ]
+    specs = [spec.strip() for _offset, spec in pieces]
+    alter = ",".join(original[match.end() + offset : match.end() + offset + len(spec)] for offset, spec in pieces).strip()
     common = {
         "tables": (normalize_identifier(name),),
-        "sql": _original(sql, statement),
+        "sql": original,
         "line": line,
         "qualified": _is_qualified(name),
+        "name": _as_written(original[match.start("name") : match.end("name")]),
     }
     for spec in specs:
         if ALTER_NOT_ONLINE_RE.match(spec):
@@ -165,6 +181,7 @@ def parse_operations(sql: str) -> list[Operation]:
                     alter=" ".join(part for part in ("ADD", kind, "INDEX", name, rest) if part),
                     qualified=_is_qualified(index.group("table")),
                     adds_unique_index=kind == "UNIQUE",
+                    name=_as_written(original[index.start("table") : index.end("table")]),
                 )
             )
             continue
@@ -179,6 +196,7 @@ def parse_operations(sql: str) -> list[Operation]:
                     line,
                     alter=f"DROP INDEX {name}",
                     qualified=_is_qualified(index.group("table")),
+                    name=_as_written(original[index.start("table") : index.end("table")]),
                 )
             )
             continue

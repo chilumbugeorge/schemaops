@@ -35,6 +35,9 @@ connection:
   statement-timeout: 60    # seconds, for statements run directly (not through pt-osc)
 
 online-schema-change:
+  # Try each ALTER as instant DDL (ALGORITHM=INSTANT) first; use pt-online-schema-change only
+  # when the server says the change cannot be instant. Set to false to always copy the table.
+  prefer-instant: true
   lock-wait-timeout: 5     # seconds a metadata lock may be waited for (maximum 5)
   max-lag: 5               # pause the copy while replicas lag more than this
   max-load: Threads_running=50

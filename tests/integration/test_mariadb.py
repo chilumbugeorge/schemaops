@@ -119,7 +119,7 @@ def test_full_cycle_with_real_pt_online_schema_change(repo: Repo, root: object):
     repo.add("dev", "2026-11-22_create_audit.sql", "CREATE TABLE audit (id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY) COMMENT='100% audited';\n")
     second = target()
     steps = deploy(repo.settings, repo.schema, "dev", second)
-    assert [step.method for step in steps] == ["pt-osc", "pt-osc", "direct"]
+    assert [step.method for step in steps] == ["online", "online", "direct"]
     assert "display_name" in columns(root, "users") and columns(root, "audit") == {"id"}
     assert sql(root, f"SELECT COUNT(*) AS total FROM {DATABASE}.users")[0]["total"] == 3  # rows survived the copy
     indexes = {row["Key_name"] for row in sql(root, f"SHOW INDEX FROM {DATABASE}.users")}
@@ -129,7 +129,9 @@ def test_full_cycle_with_real_pt_online_schema_change(repo: Repo, root: object):
 
     history = second.history()
     assert [row.status for row in history.values()] == ["success"] * 4
-    assert history[ADD_COLUMN].method == "pt-osc" and history[ADD_COLUMN].seconds is not None
+    # The server decides: adding a column is instant, adding an index needs the online copy.
+    assert history[ADD_COLUMN].method == "instant" and history[ADD_COLUMN].seconds is not None
+    assert history["2026-11-21_create_index.sql"].method == "pt-osc"
     assert deploy(repo.settings, repo.schema, "dev", second) == []  # nothing pending: a rerun is a no-op
     second.close()
 
@@ -164,11 +166,46 @@ def test_live_table_and_server_facts(repo: Repo, root: object):
     assert server.free_bytes is None or server.free_bytes > 0
     blocker.close()
 
+    # Triggers and child foreign keys only matter to the table copy: instant DDL still works...
     repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
-    with pytest.raises(DeployError, match="pre-flight checks failed") as error:
+    deploy(repo.settings, repo.schema, "dev", live)
+    assert "display_name" in columns(root, "users") and live.history()[ADD_COLUMN].method == "instant"
+
+    # ...but a change that needs the copy is refused, and nothing is altered.
+    repo.add("dev", "2026-11-21_create_index.sql", "CREATE INDEX idx_users_display_name ON users (display_name);\n")
+    with pytest.raises(DeployError, match="cannot run as instant DDL") as error:
         deploy(repo.settings, repo.schema, "dev", live)
     assert "trigger" in str(error.value) and "foreign key" in str(error.value)
-    assert "display_name" not in columns(root, "users") and ADD_COLUMN not in live.history()
+    assert "idx_users_display_name" not in {row["Key_name"] for row in sql(root, f"SHOW INDEX FROM {DATABASE}.users")}
+    live.close()
+
+
+def test_pt_osc_is_used_for_everything_when_instant_ddl_is_off(repo: Repo, root: object):
+    (repo.root / "schemaops.yaml").write_text("online-schema-change:\n  prefer-instant: false\n")
+    live = target()
+    deploy(repo.settings, repo.schema, "dev", live)
+    repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
+    deploy(repo.settings, repo.schema, "dev", live)
+    assert "display_name" in columns(root, "users") and live.history()[ADD_COLUMN].method == "pt-osc"
+    live.close()
+
+
+def test_blocked_instant_ddl_gives_up_after_five_seconds_without_copying(repo: Repo, root: object):
+    live = target()
+    deploy(repo.settings, repo.schema, "dev", live)
+    repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
+    blocker = admin()
+    sql(blocker, "START TRANSACTION")
+    sql(blocker, f"SELECT * FROM {DATABASE}.users")
+
+    started = time.monotonic()
+    with pytest.raises(DeployError, match="(?i)lock wait timeout"):
+        deploy(repo.settings, repo.schema, "dev", live)
+    assert 4 <= time.monotonic() - started <= 12
+    assert "display_name" not in columns(root, "users") and live.history()[ADD_COLUMN].status == "failed"
+    blocker.close()
+    deploy(repo.settings, repo.schema, "dev", live, retry_failed=True)
+    assert live.history()[ADD_COLUMN].method == "instant"
     live.close()
 
 

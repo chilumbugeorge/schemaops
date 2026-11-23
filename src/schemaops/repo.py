@@ -48,6 +48,7 @@ class OnlineChangeSettings:
 
     lock_wait_timeout: int = 5  # seconds a metadata lock may be waited for
     max_lag: int = 5  # pause while replicas lag more than this many seconds
+    prefer_instant: bool = True  # try ALGORITHM=INSTANT first; copy the table only if the server refuses
     max_load: str = "Threads_running=50"  # pause above this load
     critical_load: str = "Threads_running=200"  # abort above this load
     chunk_time: float = 0.5
@@ -115,6 +116,7 @@ class Settings:
                 statement_timeout=int(connection.get("statement-timeout", defaults.statement_timeout)),
                 online_change=OnlineChangeSettings(
                     lock_wait_timeout=int(online.get("lock-wait-timeout", osc.lock_wait_timeout)),
+                    prefer_instant=bool(online.get("prefer-instant", osc.prefer_instant)),
                     max_lag=int(online.get("max-lag", osc.max_lag)),
                     max_load=str(online.get("max-load", osc.max_load)),
                     critical_load=str(online.get("critical-load", osc.critical_load)),

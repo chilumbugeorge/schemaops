@@ -156,7 +156,7 @@ def test_check_mr_writes_a_plan_with_method_size_and_previous_environment_result
     assert text.startswith("<!-- schemaops-plan -->\n### schemaops checks: passed")
     assert (
         "| `2026-11-20_add_display_name.sql` | trades/accounts | UAT | ALTER `users`: ADD COLUMN display_name VARCHAR(64) NULL "
-        "| pt-online-schema-change | ~1,234,567 rows, 3.0 MB | DEV: success in 42s (pt-osc) |"
+        "| instant DDL, else pt-online-schema-change | ~1,234,567 rows, 3.0 MB | DEV: success in 42s (pt-osc) |"
     ) in text
 
 

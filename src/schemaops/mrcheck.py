@@ -199,7 +199,12 @@ def run(
             elif manual:
                 method = f"manual by DBA ({', '.join(manual)})"
             else:
-                method = "pt-online-schema-change" if operation.kind == sqlplan.ALTER_TABLE else "direct, 5s lock wait"
+                online = (
+                    "instant DDL, else pt-online-schema-change"
+                    if settings.online_change.prefer_instant
+                    else "pt-online-schema-change"
+                )
+                method = online if operation.kind == sqlplan.ALTER_TABLE else "direct, 5s lock wait"
             report.rows.append(
                 PlanRow(item.name, item.schema.label, item.environment, _describe(operation), method,
                         "; ".join(sizes) or "unknown", previous)  # fmt: skip

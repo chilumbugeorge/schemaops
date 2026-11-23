@@ -27,6 +27,7 @@ class FakeTarget:
         self.known = {"users", "orders"} if tables else set()
         self.facts: dict[str, TableFacts] = {}
         self.server = ServerFacts(oldest_transaction_seconds=0, free_bytes=None)
+        self.instant = False  # whether the "server" can apply ALTERs as instant DDL
 
     def inspect(self, table: str) -> TableFacts:
         return self.facts.get(table, TableFacts(exists=table in self.known, rows=10, size_bytes=16384))
@@ -46,9 +47,14 @@ class FakeTarget:
     def start(self, migration: Migration, method: str) -> None:
         self.rows[migration.name] = HistoryRow(migration.name, migration.sha256, "running", method)
 
-    def finish(self, migration: Migration, status: str, error: str = "") -> None:
+    def finish(self, migration: Migration, status: str, error: str = "", method: str = "") -> None:
         row = self.rows[migration.name]
-        self.rows[migration.name] = HistoryRow(row.migration, row.sha256, status, row.method)
+        self.rows[migration.name] = HistoryRow(row.migration, row.sha256, status, method or row.method)
+
+    def instant_alter(self, table: str, alter: str) -> bool:
+        if self.instant:
+            self.calls.append(("instant", f"{table}: {alter}"))
+        return self.instant
 
     def execute(self, sql: str) -> None:
         self.calls.append(("direct", sql.split("(")[0].strip()))
@@ -104,7 +110,8 @@ def test_dry_run_reports_without_changing_anything(repo: Repo):
     repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
     target = FakeTarget(tables=2, rows=done(repo, "dev", DUMP))
     steps = deploy(repo.settings, repo.schema, "dev", target, dry_run=True)
-    assert [(step.migration.name, step.method) for step in steps] == [(ADD_COLUMN, "pt-osc")]
+    assert [(step.migration.name, step.method) for step in steps] == [(ADD_COLUMN, "online")]
+    assert steps[0].detail.startswith("ALTER `users`, instant DDL, else pt-online-schema-change")
     assert target.calls == [] and not target.locked and ADD_COLUMN not in target.rows
 
 
@@ -273,9 +280,6 @@ def alter_users(repo: Repo, environment: str = "dev") -> FakeTarget:
     ("facts", "server", "message"),
     [
         (TableFacts(exists=False), ServerFacts(0), "table `users` does not exist"),
-        (TableFacts(True, 10, 1024, triggers=2), ServerFacts(0), "has 2 trigger"),
-        (TableFacts(True, 10, 1024, referenced_by=1), ServerFacts(0), "referenced by 1 foreign key"),
-        (TableFacts(True, 10, 4 * 1024**3), ServerFacts(0, free_bytes=5 * 1024**3), "not enough free disk space"),
         (TableFacts(True, 10, 1024), ServerFacts(oldest_transaction_seconds=900), "open for 900s"),
     ],
 )
@@ -331,8 +335,94 @@ def test_plan_shows_table_size_and_problems_and_knows_tables_created_earlier(rep
     create, alter_new, alter_users_step = deploy(repo.settings, repo.schema, "dev", target, dry_run=True)
     assert create.problems == () and alter_new.problems == ()
     assert "~1,234,567 rows, 3.0 MB" in alter_users_step.detail
-    assert "trigger" in alter_users_step.problems[0]
+    assert alter_users_step.problems == () and "trigger" in alter_users_step.copy_problems[0]
 
     target.known.add("audit")
     (create, *_rest) = deploy(repo.settings, repo.schema, "dev", target, dry_run=True)
     assert create.problems == ("table `audit` already exists",)
+
+
+# -------------------------------------------------------------- instant DDL
+
+COPY_BLOCKERS = [
+    (TableFacts(True, 10, 1024, triggers=2), ServerFacts(0), "has 2 trigger"),
+    (TableFacts(True, 10, 1024, referenced_by=1), ServerFacts(0), "referenced by 1 foreign key"),
+    (TableFacts(True, 10, 4 * 1024**3), ServerFacts(0, free_bytes=5 * 1024**3), "not enough free disk space"),
+]
+
+
+def test_instant_ddl_is_tried_first_and_recorded(repo: Repo):
+    target = alter_users(repo)
+    target.instant = True
+    deploy(repo.settings, repo.schema, "dev", target)
+    assert target.calls == [("instant", "users: ADD COLUMN display_name VARCHAR(64) NULL")]  # no table copy
+    assert (target.rows[ADD_COLUMN].status, target.rows[ADD_COLUMN].method) == ("success", "instant")
+
+
+def test_falls_back_to_pt_osc_when_the_server_cannot_do_it_instantly(repo: Repo):
+    target = alter_users(repo)
+    deploy(repo.settings, repo.schema, "dev", target)
+    assert target.calls == [("pt-osc", "users: ADD COLUMN display_name VARCHAR(64) NULL")]
+    assert target.rows[ADD_COLUMN].method == "pt-osc"
+
+
+def test_instant_ddl_can_be_switched_off(repo: Repo):
+    (repo.root / "schemaops.yaml").write_text("online-schema-change:\n  prefer-instant: false\n")
+    target = alter_users(repo)
+    target.instant = True
+    (step,) = deploy(repo.settings, repo.schema, "dev", target, dry_run=True)
+    assert step.detail.startswith("ALTER `users`, pt-online-schema-change")
+    deploy(repo.settings, repo.schema, "dev", target)
+    assert target.calls == [("pt-osc", "users: ADD COLUMN display_name VARCHAR(64) NULL")]
+
+
+@pytest.mark.parametrize(("facts", "server", "message"), COPY_BLOCKERS)
+def test_copy_only_problems_do_not_block_instant_ddl_but_do_block_the_fallback(
+    repo: Repo, facts: TableFacts, server: ServerFacts, message: str
+):
+    target = alter_users(repo)
+    target.facts["users"], target.server = facts, server
+    with pytest.raises(DeployError, match="cannot run as instant DDL") as error:
+        deploy(repo.settings, repo.schema, "dev", target)
+    assert message in str(error.value) and target.calls == []
+    assert target.rows[ADD_COLUMN].status == "failed"
+
+    target.instant = True
+    deploy(repo.settings, repo.schema, "dev", target, retry_failed=True)
+    assert target.rows[ADD_COLUMN].method == "instant"
+
+
+@pytest.mark.parametrize(("facts", "server", "message"), COPY_BLOCKERS)
+def test_copy_problems_block_up_front_when_instant_ddl_is_off(repo: Repo, facts: TableFacts, server: ServerFacts, message: str):
+    (repo.root / "schemaops.yaml").write_text("online-schema-change:\n  prefer-instant: false\n")
+    target = alter_users(repo)
+    target.facts["users"], target.server = facts, server
+    with pytest.raises(DeployError, match="pre-flight checks failed") as error:
+        deploy(repo.settings, repo.schema, "dev", target)
+    assert message in str(error.value) and ADD_COLUMN not in target.rows
+
+
+class InstantConnection(FakeConnection):
+    def __init__(self, errno: int | None) -> None:
+        super().__init__()
+        self.errno = errno
+
+    def execute(self, sql: str, params: object = None) -> None:
+        import pymysql
+
+        super().execute(sql, params)
+        if "ALGORITHM=INSTANT" in sql and self.errno:
+            raise pymysql.err.OperationalError(self.errno, "ALGORITHM=INSTANT is not supported. Reason: ADD INDEX")
+
+
+def test_instant_alter_statement_and_error_handling():
+    connection = InstantConnection(None)
+    assert real_target(None, connection).instant_alter("Users", "ADD COLUMN a BIGINT NULL") is True
+    assert connection.statements == [
+        "SET SESSION lock_wait_timeout = 5",
+        "ALTER TABLE `Users` ADD COLUMN a BIGINT NULL, ALGORITHM=INSTANT",
+    ]
+    for errno in (1800, 1845, 1846):
+        assert real_target(None, InstantConnection(errno)).instant_alter("users", "ADD INDEX i (a)") is False
+    with pytest.raises(DeployError):  # for example a lock wait timeout: fail, never fall back to a copy
+        real_target(None, InstantConnection(1205)).instant_alter("users", "ADD COLUMN a BIGINT NULL")

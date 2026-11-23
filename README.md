@@ -2,7 +2,15 @@
 
 Self-serve MariaDB/MySQL schema migrations for a Git monorepo, run by GitLab CI/CD. Development teams add migrations through merge requests; schemaops enforces governance, database standards, migration integrity and the promotion order **DEV → UAT → PROD**, one merge request per environment.
 
-Schema changes never block traffic: every `ALTER` runs through `pt-online-schema-change`, and no statement waits more than 5 seconds for a metadata lock.
+Schema changes never block traffic. Each `ALTER` is applied as instant DDL when the server can do it that way, and through `pt-online-schema-change` when it cannot; no statement waits more than 5 seconds for a metadata lock.
+
+Safety features, each described below:
+
+- **Instant DDL first**: metadata-only changes finish in milliseconds, whatever the table size.
+- **Pre-flight checks**: the live table is inspected just before every change.
+- **Automatic size escalation**: very large tables go to the DBA team even if nobody listed them.
+- **The plan on the merge request**: reviewers see how each migration will run before approving.
+- **Integration tests**: the deployment path is tested against a real MariaDB with the real `pt-online-schema-change`.
 
 ## Repository layout
 
@@ -140,7 +148,7 @@ Lint runs in full when a migration enters DEV. On UAT and PROD promotions the fi
 
 | Statement | Method |
 | --- | --- |
-| `ALTER TABLE`, `CREATE INDEX`, `DROP INDEX` | `pt-online-schema-change`, dry run first, in every environment and for every table size |
+| `ALTER TABLE`, `CREATE INDEX`, `DROP INDEX` | Instant DDL if the server supports it for that change; otherwise `pt-online-schema-change`, dry run first. Same in every environment and for every table size |
 | `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE` | Directly, with `lock_wait_timeout = 5` |
 | Change to a protected table, in a manual environment (PROD) | Not run. Deployment stops with exit code 3; a DBA applies it and runs `mark-applied` |
 | Change to a table over `auto-protect` limits (10 million rows or 10 GB by default), in a manual environment | Treated as protected, whether or not the table is listed |
@@ -148,18 +156,33 @@ Lint runs in full when a migration enters DEV. On UAT and PROD promotions the fi
 
 `pt-online-schema-change` runs with `lock_wait_timeout=5`, pauses on replica lag and load, and aborts on critical load; limits are in `schemaops.yaml`. The password is passed in a temporary 0600 option file, never on the command line.
 
+### Instant DDL first
+
+For every `ALTER`, schemaops first runs the change with `ALGORITHM=INSTANT` and a 5-second lock wait. Instant DDL changes only the table's metadata, so it takes milliseconds on a table of any size and causes no replica lag.
+
+- **The server decides.** schemaops does not guess which changes qualify, because that differs between MariaDB and MySQL versions. Typically adding or dropping a column, renaming a column and changing a default are instant; adding an index is not.
+- **Fallback.** If the server answers that the change cannot be instant, nothing has been changed and schemaops runs it through `pt-online-schema-change`.
+- **No blocking copy, ever.** The server's own table-copying `ALTER` is never used.
+- **A blocked lock is a failure, not a fallback.** If the instant change cannot get its metadata lock within 5 seconds, the migration fails and is retried later.
+- **Your `ALGORITHM=` and `LOCK=` clauses are ignored.** schemaops chooses both.
+- **The history records what happened**: `instant` or `pt-osc`, with the duration.
+
+Protected tables, tables over the size limit and new UNIQUE indexes still go to the DBA team in manual environments. Set `online-schema-change.prefer-instant: false` to send every `ALTER` through `pt-online-schema-change`.
+
 ### Pre-flight checks
 
-Just before each change, schemaops inspects the live table. Any failure stops the deployment before anything is changed or recorded, so a later run simply retries. `schemaops plan` shows the same checks without changing anything.
+Just before each change, schemaops inspects the live table. `schemaops plan` shows the same checks without changing anything.
 
-| Check | Fails when |
-| --- | --- |
-| Table state | The table to alter, drop or rename is missing, or the table to create already exists |
-| Triggers | The table has triggers (`pt-online-schema-change` cannot run on it) |
-| Child foreign keys | Other tables reference it; a DBA must apply the change |
-| Disk space | Free space is below `disk-headroom` × table size. Needs MariaDB's `DISKS` plugin; skipped otherwise |
-| Open transactions | A transaction has been open longer than `max-transaction-seconds` and may hold a metadata lock |
-| Table size | Above the `auto-protect` limits: escalated to the DBA team in manual environments |
+| Check | Fails when | Applies to |
+| --- | --- | --- |
+| Table state | The table to alter, drop or rename is missing, or the table to create already exists | Every change |
+| Open transactions | A transaction has been open longer than `max-transaction-seconds` and may hold a metadata lock | Every change |
+| Table size | Above the `auto-protect` limits: escalated to the DBA team in manual environments | Every change to an existing table |
+| Triggers | The table has triggers (`pt-online-schema-change` cannot run on it) | Table copy only |
+| Child foreign keys | Other tables reference it; a DBA must apply the change | Table copy only |
+| Disk space | Free space is below `disk-headroom` × table size. Needs MariaDB's `DISKS` plugin; skipped otherwise | Table copy only |
+
+A failed "every change" check stops the deployment before anything is changed or recorded, so a later run simply retries. The "table copy only" checks do not stand in the way of instant DDL. If the change turns out not to be instant and one of them fails, the migration is recorded as failed without the table being touched, and a DBA re-runs it with `--retry-failed` once the cause is resolved.
 
 ## Credentials and security
 
@@ -213,4 +236,4 @@ docker run -d --name schemaops-it -p 3306:3306 -e MARIADB_ROOT_PASSWORD=it-root-
 SCHEMAOPS_IT_HOST=127.0.0.1 SCHEMAOPS_IT_ROOT_PASSWORD=it-root-pw python -m pytest tests/integration
 ```
 
-It is skipped when `SCHEMAOPS_IT_HOST` is not set, and runs in the pipeline as the `integration-tests` job. It covers the full deploy cycle, baselining, live table facts, pre-flight failures, the 5-second metadata lock limit, the deployment lock and the read-only account. It does not cover TLS connections or replica lag throttling; verify those against your own clusters.
+It is skipped when `SCHEMAOPS_IT_HOST` is not set, and runs in the pipeline as the `integration-tests` job. It covers the full deploy cycle, instant DDL and the fallback to `pt-online-schema-change`, baselining, live table facts, pre-flight failures, the 5-second metadata lock limit, the deployment lock and the read-only account. It does not cover TLS connections or replica lag throttling; verify those against your own clusters.
