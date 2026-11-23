@@ -72,6 +72,60 @@ def _is_qualified(name: str) -> bool:
     return len(re.findall(IDENT, name)) > 1
 
 
+# (pattern on the start of the statement, what it is, what to do about it)
+UNSUPPORTED_KINDS: tuple[tuple[str, str, str], ...] = (
+    (
+        r"(?:insert|update|delete|replace|load\s+data|load\s+xml|truncate(?:\s+table)?|call|do)\b",
+        "changes data, not the table structure",
+        "Migrations may only change the schema; run data changes through the application or ask the DBA team",
+    ),
+    (
+        r"(?:(?:create|alter|drop|rename)\s+(?:user|role)|grant|revoke|set\s+password|set\s+(?:default\s+)?role)\b",
+        "is account management, not a schema change",
+        "Users, roles and privileges are managed by the DBA team",
+    ),
+    (
+        r"(?:create|alter|drop)\s+(?:database|schema)\b",
+        "creates, changes or removes a whole schema",
+        "A migration applies only to tables inside its own schema; the DBA team manages schemas",
+    ),
+    (
+        r"create\s+(?:or\s+replace\s+)?(?:definer\s*=\s*\S+\s+)?(?:view|trigger|function|procedure|event)\b"
+        r"|(?:alter|drop)\s+(?:view|trigger|function|procedure|event)\b",
+        "manages stored logic (views, triggers, routines or events)",
+        "Keep this logic in the application",
+    ),
+    (
+        r"(?:set|flush|reset|kill|install|uninstall|shutdown|purge|change\s+master|start\s+(?:slave|replica)|stop\s+(?:slave|replica))\b",
+        "changes server or session settings, not the schema",
+        "Server configuration is managed by the DBA team",
+    ),
+    (
+        r"(?:use|lock|unlock|begin|start\s+transaction|commit|rollback|savepoint)\b",
+        "is session or transaction control",
+        "It has no place in a migration: each file is one schema change, applied to its own schema",
+    ),
+    (
+        r"(?:select|show|explain|describe|desc|with|analyze|optimize|check|repair)\b",
+        "is a query or maintenance command, not a schema change",
+        "Remove it from the migration",
+    ),
+)
+TWO_WORD_STATEMENTS = ("create", "alter", "drop", "rename", "set", "load", "start", "stop", "truncate", "lock", "unlock")
+
+
+def _unsupported_reason(text: str) -> str:
+    """Say what kind of statement this is and what to do instead."""
+    words = text.split()
+    keyword = words[0].upper()
+    if words[0].lower() in TWO_WORD_STATEMENTS and len(words) > 1 and words[1].isalpha():
+        keyword = f"{keyword} {words[1].upper()}"
+    for pattern, what, instead in UNSUPPORTED_KINDS:
+        if re.match(pattern, text, re.IGNORECASE):
+            return f"{keyword} {what}. {instead}"
+    return f"{keyword} is not a supported schema change"
+
+
 def _as_written(name: str) -> str:
     """The last part of a possibly qualified, possibly quoted identifier, case preserved."""
     quoted, bare = re.findall(r"`((?:[^`]|``)+)`|([\w$]+)", name)[-1]
@@ -200,8 +254,5 @@ def parse_operations(sql: str) -> list[Operation]:
                 )
             )
             continue
-        keyword = text.split()[0].upper()
-        operations.append(
-            Operation(UNSUPPORTED, (), original, line, reason=f"{keyword} is not a supported schema change")
-        )
+        operations.append(Operation(UNSUPPORTED, (), original, line, reason=_unsupported_reason(text)))
     return operations
