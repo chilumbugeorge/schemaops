@@ -22,22 +22,23 @@ DUMP_SQL = (
 
 
 class Repo:
-    """A throwaway schemaops repository with one schema, trades/accounts."""
+    """A throwaway schemaops repository with one schema, trades/accounts by default."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, cluster: str = "trades", schema: str = "accounts") -> None:
         self.root = root
-        self.schema = Schema("trades", "accounts", root / "clusters" / "trades" / "accounts")
+        self.cluster, self.name = cluster, schema
+        self.schema = Schema(cluster, schema, root / "clusters" / cluster / schema)
         self.schema.path.mkdir(parents=True)
         (self.schema.path / "environments").mkdir()
         self.schema.main_file.write_text(
-            "cluster-name: trades\nschema-name: accounts\nowner: trades-team\ndescription: Accounts.\n"
+            f"cluster-name: {cluster}\nschema-name: {schema}\nowner: trades-team\ndescription: Accounts.\n"
         )
         for environment in ENVIRONMENTS:
             self.schema.migrations_dir(environment).mkdir(parents=True)
             self.set(environment, [])
         (root / "policy").mkdir()
         (root / "policy" / "protected_tables.yaml").write_text(
-            "protected-tables:\n  - {cluster: trades, schema: accounts, table: orders, reason: hot}\n"
+            f"protected-tables:\n  - {{cluster: {cluster}, schema: {schema}, table: orders, reason: hot}}\n"
         )
 
     @property
@@ -47,7 +48,7 @@ class Repo:
     def set(self, environment: str, names: list[str]) -> None:
         body = "".join(f"  - {name}\n" for name in names)
         self.schema.environment_file(environment).write_text(
-            f"cluster-name: trades\nschema-name: accounts\nenvironment: {environment}\n"
+            f"cluster-name: {self.cluster}\nschema-name: {self.name}\nenvironment: {environment}\n"
             + ("migrations:\n" + body if names else "migrations: []\n")
         )
 

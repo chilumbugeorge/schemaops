@@ -19,6 +19,16 @@ governance:
   manual-environments: [prod]
   # Require proof (the migration history of the previous environment) before promotion.
   verify-previous-deployment: true
+  # A table above either limit is treated as protected even if it is not listed. 0 disables a limit.
+  auto-protect:
+    max-rows: 10000000
+    max-size-gb: 10
+
+# Checks against the live table just before a change. A failure stops the deployment before
+# anything is changed.
+preflight:
+  max-transaction-seconds: 120   # refuse while a transaction has been open longer than this; 0 disables
+  disk-headroom: 1.5             # free disk space required, as a multiple of the table size; 0 disables
 
 connection:
   connect-timeout: 10      # seconds

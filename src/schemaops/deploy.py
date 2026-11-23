@@ -17,7 +17,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -64,6 +64,35 @@ class HistoryRow:
     sha256: str
     status: str
     method: str = ""
+    seconds: int | None = None  # how long the migration took
+
+
+@dataclass(frozen=True)
+class TableFacts:
+    """What the server says about a table right now."""
+
+    exists: bool
+    rows: int = 0  # InnoDB estimate
+    size_bytes: int = 0  # data plus indexes
+    triggers: int = 0
+    referenced_by: int = 0  # foreign keys in other tables that point at this one
+
+    def describe(self) -> str:
+        return f"~{self.rows:,} rows, {format_size(self.size_bytes)}" if self.exists else "does not exist"
+
+
+@dataclass(frozen=True)
+class ServerFacts:
+    oldest_transaction_seconds: int | None = None  # None: not visible to this account
+    free_bytes: int | None = None  # None: the server does not expose disk space
+
+
+def format_size(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024  # type: ignore[assignment]
+    return f"{size:.1f} TB"
 
 
 class Target(Protocol):
@@ -72,6 +101,8 @@ class Target(Protocol):
     def lock(self) -> None: ...
     def history(self) -> dict[str, HistoryRow]: ...
     def user_table_count(self) -> int: ...
+    def inspect(self, table: str) -> TableFacts: ...
+    def server_facts(self) -> ServerFacts: ...
     def start(self, migration: Migration, method: str) -> None: ...
     def finish(self, migration: Migration, status: str, error: str = "") -> None: ...
     def execute(self, sql: str) -> None: ...
@@ -121,8 +152,59 @@ class MariaDBTarget:
         )
         if not exists:
             return {}
-        rows = self._query(f"SELECT migration, sha256, status, method FROM `{HISTORY_TABLE}` ORDER BY id")
-        return {row["migration"]: HistoryRow(row["migration"], row["sha256"], row["status"], row["method"]) for row in rows}
+        rows = self._query(
+            "SELECT migration, sha256, status, method, TIMESTAMPDIFF(SECOND, started_at, finished_at) AS seconds "
+            f"FROM `{HISTORY_TABLE}` ORDER BY id"
+        )
+        return {
+            row["migration"]: HistoryRow(row["migration"], row["sha256"], row["status"], row["method"], row["seconds"])
+            for row in rows
+        }
+
+    def inspect(self, table: str) -> TableFacts:
+        where = (self.schema, table)
+        rows = self._query(
+            "SELECT table_rows AS row_count, COALESCE(data_length, 0) + COALESCE(index_length, 0) AS size_bytes "
+            "FROM information_schema.tables WHERE table_schema = %s AND table_name = %s AND table_type = 'BASE TABLE'",
+            where,
+        )
+        if not rows:
+            return TableFacts(exists=False)
+        triggers = self._query(
+            "SELECT COUNT(*) AS total FROM information_schema.triggers "
+            "WHERE event_object_schema = %s AND event_object_table = %s",
+            where,
+        )
+        children = self._query(
+            "SELECT COUNT(DISTINCT constraint_schema, constraint_name) AS total FROM information_schema.key_column_usage "
+            "WHERE referenced_table_schema = %s AND referenced_table_name = %s",
+            where,
+        )
+        return TableFacts(
+            exists=True,
+            rows=int(rows[0]["row_count"] or 0),
+            size_bytes=int(rows[0]["size_bytes"] or 0),
+            triggers=int(triggers[0]["total"]),
+            referenced_by=int(children[0]["total"]),
+        )
+
+    def server_facts(self) -> ServerFacts:
+        oldest: int | None = None
+        free: int | None = None
+        try:  # needs the PROCESS privilege
+            rows = self._query("SELECT MAX(TIMESTAMPDIFF(SECOND, trx_started, NOW())) AS oldest FROM information_schema.innodb_trx")
+            oldest = int(rows[0]["oldest"] or 0)
+        except DeployError:
+            logger.warning("cannot read open transactions (PROCESS privilege missing); skipping that pre-flight check")
+        try:  # MariaDB DISKS plugin; sizes are in KiB
+            datadir = str(self._query("SELECT @@datadir AS datadir")[0]["datadir"])
+            disks = self._query("SELECT Path AS path, Available AS available FROM information_schema.DISKS")
+            mounts = [disk for disk in disks if datadir.startswith(str(disk["path"]))]
+            if mounts:
+                free = int(max(mounts, key=lambda disk: len(str(disk["path"])))["available"]) * 1024
+        except DeployError:
+            logger.info("free disk space is not exposed by this server (DISKS plugin); skipping that pre-flight check")
+        return ServerFacts(oldest, free)
 
     def user_table_count(self) -> int:
         rows = self._query(
@@ -193,6 +275,75 @@ class Step:
     migration: Migration
     method: str  # direct | pt-osc | baseline | manual
     detail: str = ""
+    problems: tuple[str, ...] = ()  # pre-flight failures; the step will not run while any remain
+
+
+def oversized(settings: Settings, facts: TableFacts) -> str:
+    """Why a table is too big to change automatically, or an empty string."""
+    if settings.auto_protect_rows and facts.rows > settings.auto_protect_rows:
+        return f"about {facts.rows:,} rows (limit {settings.auto_protect_rows:,})"
+    if settings.auto_protect_bytes and facts.size_bytes > settings.auto_protect_bytes:
+        return f"{format_size(facts.size_bytes)} (limit {format_size(settings.auto_protect_bytes)})"
+    return ""
+
+
+def preflight(
+    settings: Settings,
+    environment: str,
+    step: Step,
+    target: Target,
+    server: ServerFacts,
+    created: frozenset[str] = frozenset(),
+) -> Step:
+    """Check the live table before changing it. Returns the step, annotated or escalated to manual.
+
+    `created` names tables an earlier pending migration will create (used when planning).
+    """
+    if step.method not in ("direct", "pt-osc") or step.migration.is_initial_dump:
+        return step
+    (operation,) = sqlplan.parse_operations(step.migration.read())
+    problems: list[str] = []
+    notes: list[str] = []
+    limit = settings.max_transaction_seconds
+    if limit and (server.oldest_transaction_seconds or 0) > limit:
+        problems.append(
+            f"a transaction has been open for {server.oldest_transaction_seconds}s and may hold a metadata lock "
+            f"(limit {limit}s); retry later"
+        )
+    if operation.kind == sqlplan.CREATE_TABLE:
+        if target.inspect(operation.table).exists and "if not exists" not in " ".join(operation.sql.lower().split()[:6]):
+            problems.append(f"table `{operation.table}` already exists")
+        return replace(step, problems=tuple(problems))
+
+    sources = operation.tables[:1] if operation.kind != sqlplan.DROP_TABLE else operation.tables
+    if operation.kind == sqlplan.RENAME_TABLE:
+        sources = operation.tables[::2]
+    for table in sources:
+        if table in created:
+            continue
+        facts = target.inspect(table)
+        if not facts.exists:
+            if not (operation.kind == sqlplan.DROP_TABLE and "if exists" in operation.sql.lower()):
+                problems.append(f"table `{table}` does not exist")
+            continue
+        notes.append(f"`{table}`: {facts.describe()}")
+        too_big = oversized(settings, facts)
+        if too_big and environment in settings.manual_environments:
+            return replace(step, method="manual", detail=f"`{table}` has {too_big}", problems=())
+        if operation.kind != sqlplan.ALTER_TABLE:
+            continue
+        if facts.triggers:
+            problems.append(f"`{table}` has {facts.triggers} trigger(s); pt-online-schema-change cannot run on it")
+        if facts.referenced_by:
+            problems.append(f"`{table}` is referenced by {facts.referenced_by} foreign key(s) in other tables; a DBA must apply this change")
+        needed = int(facts.size_bytes * settings.disk_headroom)
+        if settings.disk_headroom and server.free_bytes is not None and server.free_bytes < needed:
+            problems.append(
+                f"not enough free disk space to copy `{table}`: {format_size(server.free_bytes)} free, "
+                f"{format_size(needed)} needed"
+            )
+    detail = f"{step.detail} ({'; '.join(notes)})" if notes else step.detail
+    return replace(step, detail=detail, problems=tuple(problems))
 
 
 def _manual_reasons(
@@ -307,12 +458,27 @@ def deploy(
         verify_previous_environment(
             schema, environment, [s.migration.name for s in steps], lower_history, {s.migration.name: s.migration.sha256 for s in steps}
         )
+    server = target.server_facts() if steps else ServerFacts()
     if dry_run:
-        return steps
+        planned: list[Step] = []
+        created: set[str] = set()
+        for step in steps:
+            planned.append(preflight(settings, environment, step, target, server, frozenset(created)))
+            for operation in sqlplan.parse_operations(step.migration.read()):
+                if operation.kind == sqlplan.CREATE_TABLE:
+                    created.add(operation.table)
+        return planned
 
-    for step in steps:
+    for index, step in enumerate(steps):
+        # Checked just before each change, so it sees the tables earlier migrations created.
+        step = steps[index] = preflight(settings, environment, step, target, server)
         migration = step.migration
         context = {"schema": schema.label, "environment": environment, "migration": migration.name, "method": step.method}
+        if step.problems:
+            raise DeployError(
+                f"{schema.label} ({environment.upper()}): pre-flight checks failed for `{migration.name}`; nothing was changed:\n"
+                + "\n".join(f"  - {problem}" for problem in step.problems)
+            )
         if step.method == "manual":
             raise ManualActionRequired(
                 f"{schema.label} ({environment.upper()}): `{migration.name}` must be applied manually by the DBA team "

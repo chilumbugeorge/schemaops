@@ -63,6 +63,13 @@ class Settings:
     dba_approvers: tuple[str, ...] = ()
     manual_environments: tuple[str, ...] = ("prod",)
     verify_previous_deployment: bool = True
+    # A table larger than either limit is treated as protected even if it is not listed. 0 disables.
+    auto_protect_rows: int = 10_000_000
+    auto_protect_bytes: int = 10 * 1024**3
+    # Pre-flight: refuse to start while a transaction has been open longer than this. 0 disables.
+    max_transaction_seconds: int = 120
+    # Pre-flight: free disk space required, as a multiple of the table's size. 0 disables.
+    disk_headroom: float = 1.5
     connect_timeout: int = 10
     statement_timeout: int = 60
     online_change: OnlineChangeSettings = field(default_factory=OnlineChangeSettings)
@@ -82,6 +89,8 @@ class Settings:
         governance = data.get("governance") or {}
         connection = data.get("connection") or {}
         online = data.get("online-schema-change") or {}
+        auto = governance.get("auto-protect") or {}
+        preflight = data.get("preflight") or {}
         defaults = cls(root=root)
         osc = defaults.online_change
         try:
@@ -98,6 +107,10 @@ class Settings:
                 verify_previous_deployment=bool(
                     governance.get("verify-previous-deployment", defaults.verify_previous_deployment)
                 ),
+                auto_protect_rows=int(auto.get("max-rows", defaults.auto_protect_rows)),
+                auto_protect_bytes=int(float(auto.get("max-size-gb", defaults.auto_protect_bytes / 1024**3)) * 1024**3),
+                max_transaction_seconds=int(preflight.get("max-transaction-seconds", defaults.max_transaction_seconds)),
+                disk_headroom=float(preflight.get("disk-headroom", defaults.disk_headroom)),
                 connect_timeout=int(connection.get("connect-timeout", defaults.connect_timeout)),
                 statement_timeout=int(connection.get("statement-timeout", defaults.statement_timeout)),
                 online_change=OnlineChangeSettings(

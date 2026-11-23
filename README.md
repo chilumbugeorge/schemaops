@@ -93,7 +93,9 @@ Merge request (`check-mr`, compared with the target branch):
 | `PROMOTION` | A migration enters UAT (PROD) only if it is already merged for DEV (UAT) on the target branch |
 | `SEPARATE_CHANGES` | Migrations are not mixed with framework, policy or pipeline changes |
 | Deployment evidence | The previous environment's migration history shows the migration as deployed |
-| DBA approval | A DBA has approved any change to a protected table or any new UNIQUE index |
+| DBA approval | A DBA has approved any change to a protected table, a table over the size limit, or any new UNIQUE index |
+
+`check-mr` also posts **the plan** as a comment on the merge request and updates it on every run: each migration, how it will run, the table's current size, and how its deployment went in the previous environment. Set `SCHEMAOPS_MR_COMMENT=1` (the pipeline does); `--report FILE` writes the same Markdown to a file. The table size shows as "unknown" unless the read-only account can see the table's metadata.
 
 Deployment time (`deploy`), checked against the `_schemaops_history` table in each schema: applied migrations are unchanged (SHA-256), nothing applied has left Git, migrations apply strictly in order, a failed or interrupted migration blocks until a DBA decides, the previous environment's deployment succeeded with the same checksum, and only one deployment per schema runs at a time.
 
@@ -141,9 +143,23 @@ Lint runs in full when a migration enters DEV. On UAT and PROD promotions the fi
 | `ALTER TABLE`, `CREATE INDEX`, `DROP INDEX` | `pt-online-schema-change`, dry run first, in every environment and for every table size |
 | `CREATE TABLE`, `DROP TABLE`, `RENAME TABLE` | Directly, with `lock_wait_timeout = 5` |
 | Change to a protected table, in a manual environment (PROD) | Not run. Deployment stops with exit code 3; a DBA applies it and runs `mark-applied` |
+| Change to a table over `auto-protect` limits (10 million rows or 10 GB by default), in a manual environment | Treated as protected, whether or not the table is listed |
 | New UNIQUE index on an existing table | Not run, in any environment (pt-online-schema-change would silently drop duplicate rows) |
 
 `pt-online-schema-change` runs with `lock_wait_timeout=5`, pauses on replica lag and load, and aborts on critical load; limits are in `schemaops.yaml`. The password is passed in a temporary 0600 option file, never on the command line.
+
+### Pre-flight checks
+
+Just before each change, schemaops inspects the live table. Any failure stops the deployment before anything is changed or recorded, so a later run simply retries. `schemaops plan` shows the same checks without changing anything.
+
+| Check | Fails when |
+| --- | --- |
+| Table state | The table to alter, drop or rename is missing, or the table to create already exists |
+| Triggers | The table has triggers (`pt-online-schema-change` cannot run on it) |
+| Child foreign keys | Other tables reference it; a DBA must apply the change |
+| Disk space | Free space is below `disk-headroom` × table size. Needs MariaDB's `DISKS` plugin; skipped otherwise |
+| Open transactions | A transaction has been open longer than `max-transaction-seconds` and may hold a metadata lock |
+| Table size | Above the `auto-protect` limits: escalated to the DBA team in manual environments |
 
 ## Credentials and security
 
@@ -162,7 +178,8 @@ The configuration is validated before any connection: host, port, TLS mode, CA f
 ```sql
 -- migration account, one per cluster and environment
 GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, TRIGGER ON accounts.* TO 'schemaops_prod'@'%';
-GRANT PROCESS, REPLICATION SLAVE ON *.* TO 'schemaops_prod'@'%';   -- pt-online-schema-change lag and load checks
+-- pt-online-schema-change replica discovery, lag and load checks (MariaDB 10.5 and later)
+GRANT PROCESS, REPLICATION SLAVE, REPLICATION MASTER ADMIN, SLAVE MONITOR ON *.* TO 'schemaops_prod'@'%';
 -- read-only history account
 GRANT SELECT ON accounts._schemaops_history TO 'schemaops_prod_ro'@'%';
 ```
@@ -172,7 +189,7 @@ GRANT SELECT ON accounts._schemaops_history TO 'schemaops_prod_ro'@'%';
 1. Protect the default branch; allow merges only through approved merge requests; enable "Require approval from code owners" and adapt `CODEOWNERS`.
 2. Create environments `dev`, `uat`, `prod`; make `prod` (and ideally `uat`) a protected environment.
 3. Add the connection variables as **protected**, **masked**, **environment-scoped** CI/CD variables. Protected variables are only exposed to pipelines on protected branches, so merge request pipelines never receive deployment credentials.
-4. Give merge request pipelines only: the DEV and UAT `_HOST` and `_RO_*` variables (unprotected), and `SCHEMAOPS_GITLAB_TOKEN`, a project access token with `read_api` scope used to read labels and approvals.
+4. Give merge request pipelines only: the DEV and UAT `_HOST` and `_RO_*` variables (unprotected), and `SCHEMAOPS_GITLAB_TOKEN`, a project access token used to read labels and approvals and to post the plan. Give it the **Reporter** role and the `api` scope: enough to comment, not enough to push or merge. With `read_api` only, everything works except the plan comment.
 5. Give the PROD deploy job the UAT `_RO_*` variables and the UAT job the DEV ones, so each can verify the previous deployment. Lower environments never receive higher-environment credentials.
 6. List the DBA team's GitLab user names under `governance.dba-approvers` in `schemaops.yaml`.
 7. The pipeline image needs `git` and `percona-toolkit`.
@@ -187,4 +204,13 @@ Hardening: `check-mr` installs schemaops from the target branch, so a merge requ
 python -m pytest
 ```
 
-The suite covers governance, lint, planning, connection validation, secret redaction and deployment logic with an in-memory database stand-in and a fake `pt-online-schema-change`. It does not connect to a real MariaDB server; run a first deployment against a disposable DEV schema before relying on it.
+The unit suite covers governance, lint, planning, pre-flight checks, the merge request plan, connection validation, secret redaction and deployment logic with an in-memory database stand-in.
+
+The integration suite runs real migrations with the real `pt-online-schema-change` against a disposable MariaDB, using exactly the grants above. It creates and drops the database `schemaops_it`:
+
+```bash
+docker run -d --name schemaops-it -p 3306:3306 -e MARIADB_ROOT_PASSWORD=it-root-pw mariadb:11.4
+SCHEMAOPS_IT_HOST=127.0.0.1 SCHEMAOPS_IT_ROOT_PASSWORD=it-root-pw python -m pytest tests/integration
+```
+
+It is skipped when `SCHEMAOPS_IT_HOST` is not set, and runs in the pipeline as the `integration-tests` job. It covers the full deploy cycle, baselining, live table facts, pre-flight failures, the 5-second metadata lock limit, the deployment lock and the read-only account. It does not cover TLS connections or replica lag throttling; verify those against your own clusters.

@@ -1,0 +1,114 @@
+# schemaops pipeline.
+#
+# Merge request pipelines only validate. They receive no deployment credentials.
+# Deployments run only from the protected default branch, one environment per job.
+#
+# Required project setup is described in README.md ("GitLab setup").
+
+stages: [test, validate, deploy]
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+default:
+  # Build your own image with git, percona-toolkit and schemaops preinstalled to save time.
+  image: python:3.12-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git percona-toolkit > /dev/null
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  GIT_DEPTH: "0"
+
+unit-tests:
+  stage: test
+  rules:
+    - changes: [src/**/*, tests/**/*, pyproject.toml]
+  script:
+    - pip install --quiet ".[dev]"
+    - python -m pytest -q
+
+# Runs real migrations with the real pt-online-schema-change against a throwaway MariaDB.
+integration-tests:
+  stage: test
+  services:
+    - name: mariadb:11.4
+      alias: mariadb
+  variables:
+    MARIADB_ROOT_PASSWORD: it-root-pw
+    SCHEMAOPS_IT_HOST: mariadb
+    SCHEMAOPS_IT_ROOT_PASSWORD: it-root-pw
+  rules:
+    - changes: [src/**/*, tests/**/*, pyproject.toml]
+  script:
+    - pip install --quiet ".[dev]"
+    - python -m pytest -q tests/integration
+
+check-mr:
+  stage: validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  variables:
+    SCHEMAOPS_MR_COMMENT: "1"                  # post the plan on the merge request
+    SCHEMAOPS_MR_REPORT: schemaops-plan.md     # and keep it as a job artifact
+  artifacts:
+    when: always
+    paths: [schemaops-plan.md]
+  script:
+    # Run the checks with the tool as it is on the target branch, not the copy in the merge request.
+    - git fetch --quiet origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - git worktree add --quiet /tmp/trusted "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+    - pip install --quiet /tmp/trusted
+    - schemaops check-mr
+
+.deploy:
+  stage: deploy
+  interruptible: false
+  script:
+    - pip install --quiet .
+    - schemaops deploy --env "$SCHEMAOPS_ENV" --changed-since "$CI_COMMIT_BEFORE_SHA"
+  # Exit code 3: stopped at a migration the DBA team must apply by hand.
+  allow_failure:
+    exit_codes: [3]
+
+deploy-dev:
+  extends: .deploy
+  environment: dev
+  resource_group: schemaops-dev
+  variables: { SCHEMAOPS_ENV: dev }
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes: [clusters/**/migrations/dev/*, clusters/**/environments/dev.yaml]
+
+deploy-uat:
+  extends: .deploy
+  environment: uat
+  resource_group: schemaops-uat
+  variables: { SCHEMAOPS_ENV: uat }
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes: [clusters/**/migrations/uat/*, clusters/**/environments/uat.yaml]
+
+deploy-prod:
+  extends: .deploy
+  environment: prod          # protected environment: only approved deployers can start it
+  resource_group: schemaops-prod
+  variables: { SCHEMAOPS_ENV: prod }
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"
+      changes: [clusters/**/migrations/prod/*, clusters/**/environments/prod.yaml]
+      when: manual
+
+# DBA only. Start from "Run pipeline" on the default branch with the four variables set,
+# after applying a protected-table change by hand.
+mark-applied:
+  stage: deploy
+  environment: $MARK_ENV
+  resource_group: schemaops-$MARK_ENV
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "web" && $MARK_FILE
+  script:
+    - pip install --quiet .
+    - schemaops mark-applied --env "$MARK_ENV" --cluster "$MARK_CLUSTER" --schema "$MARK_SCHEMA" --file "$MARK_FILE"

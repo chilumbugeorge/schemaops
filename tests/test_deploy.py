@@ -5,7 +5,7 @@ import pytest
 
 from schemaops import deploy as deploy_module
 from schemaops.db import ConnectionConfig
-from schemaops.deploy import HistoryRow, MariaDBTarget, deploy, mark_applied
+from schemaops.deploy import HistoryRow, MariaDBTarget, ServerFacts, TableFacts, deploy, mark_applied
 from schemaops.errors import DeployError, GovernanceError, ManualActionRequired
 from schemaops.repo import Migration, OnlineChangeSettings
 
@@ -24,6 +24,15 @@ class FakeTarget:
         self.fail_on = fail_on
         self.calls: list[tuple[str, str]] = []
         self.locked = False
+        self.known = {"users", "orders"} if tables else set()
+        self.facts: dict[str, TableFacts] = {}
+        self.server = ServerFacts(oldest_transaction_seconds=0, free_bytes=None)
+
+    def inspect(self, table: str) -> TableFacts:
+        return self.facts.get(table, TableFacts(exists=table in self.known, rows=10, size_bytes=16384))
+
+    def server_facts(self) -> ServerFacts:
+        return self.server
 
     def lock(self) -> None:
         self.locked = True
@@ -46,6 +55,8 @@ class FakeTarget:
         if self.fail_on and self.fail_on in sql:
             raise DeployError("boom")
         self.tables += 1
+        if sql.upper().startswith("CREATE TABLE"):
+            self.known.add(sql.split()[2].lower())
 
     def online_alter(self, table: str, alter: str) -> None:
         self.calls.append(("pt-osc", f"{table}: {alter}"))
@@ -247,3 +258,81 @@ def test_direct_statements_set_a_short_metadata_lock_wait():
     ddl = "CREATE TABLE t (id BIGINT UNSIGNED PRIMARY KEY) COMMENT='top 10% of users'"
     real_target(None, connection).execute(ddl)
     assert connection.statements == ["SET SESSION lock_wait_timeout = 5", ddl]
+
+
+# --------------------------------------------------------------- pre-flight
+
+
+def alter_users(repo: Repo, environment: str = "dev") -> FakeTarget:
+    for env in ("dev", "uat", "prod")[: ("dev", "uat", "prod").index(environment) + 1]:
+        repo.add(env, ADD_COLUMN, ADD_COLUMN_SQL)
+    return FakeTarget(tables=2, rows=done(repo, environment, DUMP))
+
+
+@pytest.mark.parametrize(
+    ("facts", "server", "message"),
+    [
+        (TableFacts(exists=False), ServerFacts(0), "table `users` does not exist"),
+        (TableFacts(True, 10, 1024, triggers=2), ServerFacts(0), "has 2 trigger"),
+        (TableFacts(True, 10, 1024, referenced_by=1), ServerFacts(0), "referenced by 1 foreign key"),
+        (TableFacts(True, 10, 4 * 1024**3), ServerFacts(0, free_bytes=5 * 1024**3), "not enough free disk space"),
+        (TableFacts(True, 10, 1024), ServerFacts(oldest_transaction_seconds=900), "open for 900s"),
+    ],
+)
+def test_preflight_failures_stop_before_anything_changes(repo: Repo, facts: TableFacts, server: ServerFacts, message: str):
+    target = alter_users(repo)
+    target.facts["users"], target.server = facts, server
+    with pytest.raises(DeployError, match="pre-flight checks failed") as error:
+        deploy(repo.settings, repo.schema, "dev", target)
+    assert message in str(error.value)
+    assert target.calls == [] and ADD_COLUMN not in target.rows  # nothing ran, nothing recorded: a rerun retries
+
+    target.facts.clear()
+    target.server = ServerFacts(0, free_bytes=10 * 1024**4)
+    deploy(repo.settings, repo.schema, "dev", target)
+    assert target.rows[ADD_COLUMN].status == "success"
+
+
+def test_unknown_server_facts_do_not_block(repo: Repo):
+    target = alter_users(repo)
+    target.server = ServerFacts(oldest_transaction_seconds=None, free_bytes=None)
+    deploy(repo.settings, repo.schema, "dev", target)
+    assert target.calls == [("pt-osc", "users: ADD COLUMN display_name VARCHAR(64) NULL")]
+
+
+def test_large_tables_are_escalated_to_the_dba_in_manual_environments_only(repo: Repo):
+    big = TableFacts(exists=True, rows=25_000_000, size_bytes=1024**3)
+    dev = alter_users(repo, "prod")
+    dev.facts["users"] = big
+    deploy(repo.settings, repo.schema, "dev", dev)
+    assert dev.calls == [("pt-osc", "users: ADD COLUMN display_name VARCHAR(64) NULL")]
+
+    prod = FakeTarget(tables=2, rows=done(repo, "prod", DUMP))
+    prod.facts["users"] = big
+    with pytest.raises(ManualActionRequired, match=r"about 25,000,000 rows \(limit 10,000,000\)"):
+        deploy(repo.settings, repo.schema, "prod", prod, lower_history=done(repo, "uat", DUMP, ADD_COLUMN))
+    assert prod.calls == []
+
+    prod.facts["users"] = TableFacts(exists=True, rows=10, size_bytes=11 * 1024**3)
+    (step,) = deploy(repo.settings, repo.schema, "prod", prod, lower_history=done(repo, "uat", DUMP, ADD_COLUMN), dry_run=True)
+    assert step.method == "manual" and "11.0 GB (limit 10.0 GB)" in step.detail
+
+    (repo.root / "schemaops.yaml").write_text("governance:\n  auto-protect: {max-rows: 0, max-size-gb: 0}\n")
+    deploy(repo.settings, repo.schema, "prod", prod, lower_history=done(repo, "uat", DUMP, ADD_COLUMN))
+    assert prod.rows[ADD_COLUMN].status == "success"
+
+
+def test_plan_shows_table_size_and_problems_and_knows_tables_created_earlier(repo: Repo):
+    repo.add("dev", "2026-11-20_create_audit.sql", "CREATE TABLE audit (id BIGINT UNSIGNED PRIMARY KEY);\n")
+    repo.add("dev", "2026-11-21_add_audit_note.sql", "ALTER TABLE audit ADD COLUMN note VARCHAR(64) NULL;\n")
+    repo.add("dev", "2026-11-22_add_users_note.sql", "ALTER TABLE users ADD COLUMN note VARCHAR(64) NULL;\n")
+    target = FakeTarget(tables=2, rows=done(repo, "dev", DUMP))
+    target.facts["users"] = TableFacts(True, rows=1_234_567, size_bytes=3 * 1024**2, triggers=1)
+    create, alter_new, alter_users_step = deploy(repo.settings, repo.schema, "dev", target, dry_run=True)
+    assert create.problems == () and alter_new.problems == ()
+    assert "~1,234,567 rows, 3.0 MB" in alter_users_step.detail
+    assert "trigger" in alter_users_step.problems[0]
+
+    target.known.add("audit")
+    (create, *_rest) = deploy(repo.settings, repo.schema, "dev", target, dry_run=True)
+    assert create.problems == ("table `audit` already exists",)

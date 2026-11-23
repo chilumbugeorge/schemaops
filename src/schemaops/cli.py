@@ -10,12 +10,12 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from schemaops import __version__, governance, log, sqlplan
+from schemaops import __version__, governance, log, mrcheck
 from schemaops.db import ConnectionConfig
 from schemaops.deploy import (
-    DONE,
     HistoryRow,
     MariaDBTarget,
+    TableFacts,
     deploy,
     mark_applied,
     pending_steps,
@@ -23,8 +23,7 @@ from schemaops.deploy import (
 )
 from schemaops.errors import ConfigError, GovernanceError, ManualActionRequired, SchemaOpsError
 from schemaops.gitlab import MergeRequest
-from schemaops.lint.model import Finding, Severity
-from schemaops.lint.rules import RULES, lint_sql
+from schemaops.lint.rules import RULES
 from schemaops.repo import (
     ENVIRONMENTS,
     INITIAL_DUMP_RE,
@@ -34,7 +33,6 @@ from schemaops.repo import (
     Settings,
     discover_schemas,
     find_schema,
-    load_protected_tables,
     previous_environment,
 )
 
@@ -117,26 +115,18 @@ def _lower_history(settings: Settings, schema: Schema, environment: str) -> dict
         target.close()
 
 
-def _is_blocking(finding: Finding, settings: Settings, *, bypass: bool, promoted: bool) -> bool:
-    if finding.severity is Severity.ERROR:
-        return True
-    if promoted or bypass:
-        return False  # promoted files were accepted when they entered DEV
-    return finding.severity.value in settings.blocking_without_label
-
-
-def _lint_file(path: Path, settings: Settings, *, bypass: bool, promoted: bool = False) -> tuple[int, int]:
-    """Print findings for one file. Returns (blocking, total)."""
+def _table_facts(settings: Settings, schema: Schema, environment: str, table: str) -> TableFacts | None:
+    """Size of a table in its target environment, if the read-only account can see it."""
     try:
-        sql = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        _out(f"{path}: error: [FILE] cannot be read as UTF-8 text ({exc})")
-        return 1, 1
-    findings = lint_sql(sql, initial_dump=bool(INITIAL_DUMP_RE.match(path.name)))
-    shown = path.relative_to(settings.root).as_posix() if path.is_relative_to(settings.root) else str(path)
-    for finding in findings:
-        _out(finding.format(shown))
-    return sum(_is_blocking(f, settings, bypass=bypass, promoted=promoted) for f in findings), len(findings)
+        target = _target(settings, schema, environment, read_only=True)
+    except SchemaOpsError:
+        return None
+    try:
+        return target.inspect(table)
+    except SchemaOpsError:
+        return None
+    finally:
+        target.close()
 
 
 # ----------------------------------------------------------------- commands
@@ -160,11 +150,11 @@ def cmd_lint(settings: Settings, args: argparse.Namespace) -> int:
             for migration in schema.migrations("dev")
             if migration.path.is_file()
         ]
-    blocking = total = 0
-    for path in paths:
-        found = _lint_file(path, settings, bypass=args.ignore_linting)
-        blocking, total = blocking + found[0], total + found[1]
-    _out(f"Linted {len(paths)} file(s): {total} finding(s), {blocking} blocking.")
+    found = [entry for path in paths for entry in mrcheck.lint_file(path, settings, bypass=args.ignore_linting)]
+    for shown, finding, _blocking in found:
+        _out(finding.format(shown))
+    blocking = sum(entry[2] for entry in found)
+    _out(f"Linted {len(paths)} file(s): {len(found)} finding(s), {blocking} blocking.")
     return 1 if blocking else 0
 
 
@@ -177,99 +167,31 @@ def cmd_rules(settings: Settings, args: argparse.Namespace) -> int:
 
 
 def cmd_check_mr(settings: Settings, args: argparse.Namespace) -> int:
-    in_ci = bool(os.environ.get("CI"))
     request = MergeRequest.from_env()
     base = args.base or (request.base_sha if request else "")
     if not base:
         raise ConfigError("No target commit: pass --base REF (for example --base origin/main).")
     labels = set(request.labels) if request else set()
     labels.update(args.label or [])
-    bypass = settings.bypass_label in labels
-
-    problems = 0
-    _out("== Governance ==")
-    issues = governance.check_repository(settings)
-    diff_issues, added = governance.check_merge_request(settings, base)
-    for issue in [*issues, *diff_issues]:
-        _out(issue.format())
-    problems += len(issues) + len(diff_issues)
-    _out(f"{len(issues) + len(diff_issues)} issue(s); {len(added)} new migration(s) in this merge request.")
-
-    _out("\n== Lint ==")
-    blocking = total = 0
-    for item in added:
-        if item.path.is_file():
-            found = _lint_file(item.path, settings, bypass=bypass, promoted=item.environment != "dev")
-            blocking, total = blocking + found[0], total + found[1]
-    note = f" (label `{settings.bypass_label}` set: warn and advise findings do not block)" if bypass else ""
-    _out(f"{total} finding(s), {blocking} blocking{note}.")
-    if blocking and not bypass:
-        _out(f"Fix the findings, or add the `{settings.bypass_label}` label to accept warn/advise findings. Errors always block.")
-    problems += blocking
-
-    _out("\n== DBA approval ==")
-    protected = load_protected_tables(settings)
-    needs_dba: list[str] = []
-    for item in added:
-        if not item.path.is_file() or INITIAL_DUMP_RE.match(item.name):
-            continue
-        for operation in sqlplan.parse_operations(item.path.read_text(encoding="utf-8")):
-            hot = [t for t in operation.tables if (item.schema.cluster, item.schema.name, t) in protected]
-            if hot:
-                needs_dba.append(f"{item.name}: changes protected table(s) {', '.join(hot)}")
-            if operation.adds_unique_index:
-                needs_dba.append(f"{item.name}: adds a UNIQUE index to `{operation.table}`")
-    for line in needs_dba:
-        _out(line)
-    if not needs_dba:
-        _out("Not required.")
-    elif request is None and not in_ci:
-        _out("DBA approval will be required on the merge request (cannot be checked outside GitLab).")
-    else:
-        try:
-            approvers = request.approvers() if request else set()
-        except GovernanceError as exc:
-            approvers = set()
-            _out(f"Cannot read approvals: {exc}")
-        dba = approvers & set(settings.dba_approvers)
-        if dba:
-            _out(f"Approved by DBA: {', '.join(sorted(dba))}.")
-        else:
-            _out("BLOCKED: a member of the DBA team must approve this merge request, then re-run this job.")
-            problems += 1
-        _out("In manual environments the DBA team applies these changes by hand.")
-
-    _out("\n== Promotion ==")
-    promoted: dict[tuple[Schema, str], list[str]] = {}
-    for item in added:
-        if previous_environment(item.environment):
-            promoted.setdefault((item.schema, item.environment), []).append(item.name)
-    if not promoted:
-        _out("No promotion in this merge request.")
-    for (schema, environment), names in promoted.items():
-        lower = previous_environment(environment) or ""
-        if not settings.verify_previous_deployment:
-            _out(f"{schema.label}: deployment evidence check is disabled.")
-            continue
-        try:
-            history = _lower_history(settings, schema, environment) or {}
-            shas = {name: (schema.migrations_dir(environment) / name) for name in names}
-            verify_previous_environment(
-                schema, environment, names, history, {n: _sha(p) for n, p in shas.items() if p.is_file()}
-            )
-            _out(f"{schema.label}: {len(names)} migration(s) confirmed deployed to {lower.upper()}.")
-        except ConfigError as exc:
-            if in_ci:
-                _out(f"BLOCKED: {schema.label}: cannot confirm the {lower.upper()} deployment. {exc}")
-                problems += 1
-            else:
-                _out(f"{schema.label}: {lower.upper()} deployment not checked (no read-only credentials locally).")
-        except SchemaOpsError as exc:
-            _out(f"BLOCKED: {exc}")
-            problems += 1
-
-    _out(f"\nResult: {'FAILED' if problems else 'PASSED'} ({problems} blocking problem(s)).")
-    return 1 if problems else 0
+    report = mrcheck.run(
+        settings,
+        base,
+        labels=labels,
+        request=request,
+        in_ci=bool(os.environ.get("CI")),
+        lower_history=lambda *call: _lower_history(*call),
+        inspect_table=lambda *call: _table_facts(*call),
+    )
+    _out(mrcheck.render_text(report))
+    markdown = log.redact(mrcheck.render_markdown(report))
+    if args.report:
+        Path(args.report).write_text(markdown, encoding="utf-8")
+    if args.comment:
+        if request is None:
+            logger.warning("--comment ignored: not running in a merge request pipeline")
+        elif request.post_comment(markdown, mrcheck.MARKER):
+            logger.info("plan posted to the merge request")
+    return 0 if report.passed else 1
 
 
 def _sha(path: Path) -> str:
@@ -315,6 +237,8 @@ def cmd_deploy(settings: Settings, args: argparse.Namespace) -> int:
             _out(f"{schema.label} ({args.env.upper()}): {verb} {len(steps)} migration(s).")
             for step in steps:
                 _out(f"  {step.migration.name}  [{step.method}] {step.detail}")
+                for problem in step.problems:
+                    _out(f"      PRE-FLIGHT: {problem}")
         except ManualActionRequired as exc:
             _out(str(exc))
             exit_code = max(exit_code, exc.exit_code)
@@ -462,6 +386,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = commands.add_parser("check-mr", help="All merge request checks: governance, lint, approvals, promotion.")
     sub.add_argument("--base", help="Target commit (default: CI_MERGE_REQUEST_DIFF_BASE_SHA).")
     sub.add_argument("--label", action="append", help="Merge request label, for local runs.")
+    sub.add_argument(
+        "--report",
+        metavar="FILE",
+        default=os.environ.get("SCHEMAOPS_MR_REPORT"),
+        help="Also write the plan as Markdown to FILE (or set SCHEMAOPS_MR_REPORT).",
+    )
+    sub.add_argument(
+        "--comment",
+        action="store_true",
+        default=os.environ.get("SCHEMAOPS_MR_COMMENT", "").lower() in ("1", "true", "yes"),
+        help="Post the plan as a comment on the merge request (or set SCHEMAOPS_MR_COMMENT=1).",
+    )
     sub.set_defaults(run=cmd_check_mr)
 
     sub = commands.add_parser("plan", help="Show what a deployment would apply; changes nothing.")
