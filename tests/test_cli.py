@@ -22,8 +22,13 @@ def test_scaffolding_commands_produce_a_repository_that_passes_governance(tmp_pa
     root = tmp_path / "repo"
     root.mkdir()
     base = ["--root", str(root)]
-    assert cli.main([*base, "new-schema", "--cluster", "trades", "--schema", "ledger", "--owner", "trades-team",
-                     "--description", "Ledger.", "--initial-dump", str(dump)]) == 0  # fmt: skip
+    new_schema = [*base, "new-schema", "--cluster", "trades", "--schema", "ledger", "--owner", "trades-team",
+                  "--description", "Ledger.", "--tier", "2", "--initial-dump", str(dump)]  # fmt: skip
+    assert cli.main(new_schema) == 2  # the cluster must be onboarded first
+    assert cli.main([*base, "new-cluster", "--cluster", "trades", "--description", "Trading.", "--version", "10.11",
+                     "--dba-contact", "#dba"]) == 0  # fmt: skip
+    assert cli.main(new_schema) == 0
+    assert "tier: 2" in (root / "clusters" / "trades" / "ledger" / "schema.yaml").read_text()
     assert cli.main([*base, "new-migration", "--cluster", "trades", "--schema", "ledger", "--name", "add_users_email"]) == 0
     schema_dir = root / "clusters" / "trades" / "ledger"
     (created,) = [path for path in (schema_dir / "migrations" / "dev").iterdir() if "add_users_email" in path.name]
@@ -40,9 +45,9 @@ def test_scaffolding_commands_produce_a_repository_that_passes_governance(tmp_pa
 
 
 def test_validate_fails_on_governance_issues(repo: Repo, capsys: pytest.CaptureFixture[str]):
-    repo.schema.main_file.unlink()
+    repo.schema.config_file.unlink()
     assert run(repo, "validate") == 1
-    assert "[MAIN_CONFIG]" in capsys.readouterr().out
+    assert "[SCHEMA_CONFIG]" in capsys.readouterr().out
 
 
 def test_check_mr_label_bypasses_warn_and_advise_but_never_errors(git_repo: Repo, capsys: pytest.CaptureFixture[str]):
@@ -225,3 +230,46 @@ def test_plan_comment_is_created_once_then_updated_and_never_fails_the_check(
 
     monkeypatch.setattr(MergeRequest, "_call", broken_call)
     assert run(git_repo, "check-mr", "--comment") == 0  # a failed comment never fails the check
+
+
+def test_tier_one_schema_needs_dba_approval_for_prod_and_the_plan_names_the_schema(
+    git_repo: Repo, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    (git_repo.root / "schemaops.yaml").write_text("governance:\n  dba-approvers: [dana]\n")
+    with git_repo.schema.config_file.open("a") as handle:
+        handle.write("tier: 1\ndata-classification: restricted\n")
+    name = "2026-11-20_add_display_name.sql"
+    for environment in ("dev", "uat"):
+        git_repo.add(environment, name, ALTER)
+    base = git_repo.commit("uat merged")
+    git_repo.add("prod", name, ALTER)
+    sha = Migration(name, git_repo.schema.migrations_dir("uat") / name).sha256
+    monkeypatch.setattr(cli, "_lower_history", lambda *call: {name: HistoryRow(name, sha, "success", "instant", 0)})
+    monkeypatch.setattr(cli, "_table_facts", lambda *call: None)
+    monkeypatch.setenv("CI", "true")
+    monkeypatch.setenv("CI_MERGE_REQUEST_IID", "9")
+    monkeypatch.setenv("CI_MERGE_REQUEST_DIFF_BASE_SHA", base)
+    monkeypatch.setattr(cli.MergeRequest, "approvers", lambda self: set())
+    report = tmp_path / "plan.md"
+
+    assert run(git_repo, "check-mr", "--report", str(report)) == 1
+    text = report.read_text()
+    assert "trades/accounts is a tier 1 schema: PROD changes need DBA approval" in text
+    assert "- trades/accounts: owner trades-team, tier 1, data restricted" in text
+    monkeypatch.setattr(cli.MergeRequest, "approvers", lambda self: {"dana"})
+    assert run(git_repo, "check-mr") == 0
+
+
+def test_host_can_come_from_cluster_yaml_but_credentials_cannot(repo: Repo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    with repo.cluster_file.open("a") as handle:
+        handle.write("environments:\n  dev: {host: db-dev.internal, port: 3307, tls-mode: disabled}\n")
+    assert run(repo, "validate") == 0
+    scope = ["plan", "--env", "dev", "--cluster", "trades", "--schema", "accounts"]
+    assert run(repo, *scope) == 2
+    error = capsys.readouterr().err
+    assert "SCHEMAOPS_TRADES_DEV_USER" in error and "SCHEMAOPS_TRADES_DEV_HOST" not in error  # only credentials are missing
+
+    with repo.cluster_file.open("a") as handle:
+        handle.write("  uat: {host: db-uat.internal, password: hunter2}\n")
+    assert run(repo, "validate") == 1
+    assert "credentials must never be stored in Git" in capsys.readouterr().out

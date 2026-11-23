@@ -31,6 +31,7 @@ from schemaops.repo import (
     NAME_RE,
     Schema,
     Settings,
+    cluster_connection,
     discover_schemas,
     find_schema,
     previous_environment,
@@ -99,6 +100,7 @@ def _target(settings: Settings, schema: Schema, environment: str, *, read_only: 
         read_only=read_only,
         connect_timeout=settings.connect_timeout,
         statement_timeout=settings.statement_timeout,
+        defaults=cluster_connection(settings, schema.cluster, environment),
     )
     logger.info("connecting", extra={"schema": schema.label, "environment": environment, **config.describe()})
     return MariaDBTarget(config, schema.name, settings.online_change)
@@ -289,21 +291,29 @@ def cmd_new_schema(settings: Settings, args: argparse.Namespace) -> int:
         if not NAME_RE.match(value):
             raise ConfigError(f"`{value}` must be lower snake_case.")
     schema = Schema(args.cluster, args.schema, settings.clusters_dir / args.cluster / args.schema)
-    if schema.main_file.exists():
+    if schema.config_file.exists():
         raise ConfigError(f"{schema.label} already exists.")
     dump = Path(args.initial_dump)
     if not dump.is_file():
         raise ConfigError(f"Initial dump {dump} not found. Create it with: mysqldump --no-data --skip-add-drop-table --skip-comments")
+    if not (schema.path.parent / "cluster.yaml").is_file():
+        raise ConfigError(f"Cluster `{schema.cluster}` is not set up yet. Run `schemaops new-cluster` first.")
     schema.path.mkdir(parents=True)
-    schema.main_file.write_text(
-        f"# Identity and ownership of the {schema.label} schema. Created once.\n"
-        f"cluster-name: {schema.cluster}\n"
-        f"schema-name: {schema.name}\n"
-        f"owner: {args.owner}\n"
-        f"description: {args.description}\n"
-        f"contact: \"{args.contact}\"\n",
-        encoding="utf-8",
-    )
+    lines = [
+        f"# Identity and ownership of the {schema.label} schema.",
+        f"cluster-name: {schema.cluster}",
+        f"schema-name: {schema.name}",
+        f"owner: {args.owner}",
+        f"description: {args.description}",
+        "status: active                  # active | frozen | retired (frozen and retired accept no new migrations)",
+        f"tier: {args.tier}                         # 1 (most critical) to 3; tier 1 needs DBA approval for PROD",
+        f"data-classification: {args.data_classification}   # public | internal | confidential | restricted",
+    ]
+    if args.owner_group:
+        lines.append(f'owner-group: "{args.owner_group}"')
+    if args.contact:
+        lines.append(f'contact: "{args.contact}"')
+    schema.config_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     name = f"{date.today().isoformat()}_initial_dump.sql"
     (schema.path / "environments").mkdir()
     for environment in ENVIRONMENTS:
@@ -314,6 +324,34 @@ def cmd_new_schema(settings: Settings, args: argparse.Namespace) -> int:
     shutil.copyfile(dump, schema.migrations_dir("dev") / name)
     (schema.migrations_dir("dev") / ".gitkeep").unlink()
     _out(f"Created {schema.path.relative_to(settings.root)} with {name} registered in DEV.")
+    return 0
+
+
+def cmd_new_cluster(settings: Settings, args: argparse.Namespace) -> int:
+    if not NAME_RE.match(args.cluster):
+        raise ConfigError(f"`{args.cluster}` must be lower snake_case.")
+    path = settings.clusters_dir / args.cluster
+    if (path / "cluster.yaml").exists():
+        raise ConfigError(f"Cluster `{args.cluster}` already exists.")
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "cluster.yaml").write_text(
+        f"# Facts shared by every schema on the {args.cluster} cluster. Owned by the DBA team.\n"
+        f"cluster-name: {args.cluster}\n"
+        f"description: {args.description}\n"
+        f"engine: {args.engine}              # mariadb | mysql\n"
+        f'version: "{args.version}"\n'
+        f"topology: {args.topology}    # standalone | primary-replica | galera\n"
+        f'dba-contact: "{args.dba_contact}"\n'
+        "\n"
+        "# Optional, non-secret connection details. Credentials never go here: they stay in\n"
+        "# CI/CD variables. A SCHEMAOPS_<CLUSTER>_<ENV>_HOST variable, when set, wins.\n"
+        "# environments:\n"
+        "#   dev:  {host: db-dev.example.internal, port: 3306, tls-mode: verify-identity}\n"
+        "#   uat:  {host: db-uat.example.internal, port: 3306, tls-mode: verify-identity}\n"
+        "#   prod: {host: db-prod.example.internal, port: 3306, tls-mode: verify-identity}\n",
+        encoding="utf-8",
+    )
+    _out(f"Created {(path / 'cluster.yaml').relative_to(settings.root)}.")
     return 0
 
 
@@ -423,11 +461,25 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--file", required=True, help="Migration file name.")
     sub.set_defaults(run=cmd_mark_applied)
 
-    sub = commands.add_parser("new-schema", help="Onboard a schema: main.yaml, environment files, initial dump.")
+    sub = commands.add_parser("new-cluster", help="Onboard a cluster: creates its cluster.yaml.")
+    sub.add_argument("--cluster", required=True)
+    sub.add_argument("--description", required=True)
+    sub.add_argument("--engine", choices=("mariadb", "mysql"), default="mariadb")
+    sub.add_argument("--version", required=True, help='Server version, for example "10.11".')
+    sub.add_argument("--topology", choices=("standalone", "primary-replica", "galera"), default="primary-replica")
+    sub.add_argument("--dba-contact", required=True, help="Channel or address of the DBA team.")
+    sub.set_defaults(run=cmd_new_cluster)
+
+    sub = commands.add_parser("new-schema", help="Onboard a schema: schema.yaml, environment files, initial dump.")
     schema_args(sub, required=True)
     sub.add_argument("--owner", required=True, help="Owning team.")
+    sub.add_argument("--owner-group", default="", help="GitLab group that owns it, for example @acme/trades-team.")
     sub.add_argument("--description", required=True)
     sub.add_argument("--contact", default="", help="Channel or address for questions.")
+    sub.add_argument("--tier", type=int, choices=(1, 2, 3), default=3, help="Criticality; 1 is the most critical.")
+    sub.add_argument(
+        "--data-classification", choices=("public", "internal", "confidential", "restricted"), default="internal"
+    )
     sub.add_argument("--initial-dump", required=True, help="Schema-only dump of the existing schema.")
     sub.set_defaults(run=cmd_new_schema)
 

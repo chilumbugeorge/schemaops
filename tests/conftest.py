@@ -29,17 +29,22 @@ class Repo:
         self.cluster, self.name = cluster, schema
         self.schema = Schema(cluster, schema, root / "clusters" / cluster / schema)
         self.schema.path.mkdir(parents=True)
+        self.cluster_file = self.schema.path.parent / "cluster.yaml"
+        self.cluster_file.write_text(
+            f'cluster-name: {cluster}\ndescription: Test cluster.\nengine: mariadb\nversion: "10.11"\ndba-contact: "#dba"\n'
+        )
         (self.schema.path / "environments").mkdir()
-        self.schema.main_file.write_text(
+        self.schema.config_file.write_text(
             f"cluster-name: {cluster}\nschema-name: {schema}\nowner: trades-team\ndescription: Accounts.\n"
         )
         for environment in ENVIRONMENTS:
             self.schema.migrations_dir(environment).mkdir(parents=True)
             self.set(environment, [])
-        (root / "policy").mkdir()
-        (root / "policy" / "protected_tables.yaml").write_text(
-            f"protected-tables:\n  - {{cluster: {cluster}, schema: {schema}, table: orders, reason: hot}}\n"
-        )
+        if not (root / "policy").exists():  # a second schema shares the first one's policy file
+            (root / "policy").mkdir()
+            (root / "policy" / "protected_tables.yaml").write_text(
+                f"protected-tables:\n  - {{cluster: {cluster}, schema: {schema}, table: orders, reason: hot}}\n"
+            )
 
     @property
     def settings(self) -> Settings:

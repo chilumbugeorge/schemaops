@@ -17,24 +17,71 @@ Safety features, each described below:
 ```text
 schemaops.yaml                      framework settings (all optional)
 policy/protected_tables.yaml        hot and large tables (DBA team)
-clusters/<cluster>/<schema>/
-  main.yaml                         identity and ownership, created once
-  environments/{dev,uat,prod}.yaml  migrations registered per environment
-  migrations/{dev,uat,prod}/        <YYYY-MM-DD>_<description>.sql
+clusters/<cluster>/
+  cluster.yaml                      facts shared by every schema on the cluster (DBA team)
+  <schema>/
+    schema.yaml                     identity, ownership and classification of the schema
+    environments/{dev,uat,prod}.yaml  migrations registered per environment
+    migrations/{dev,uat,prod}/      <YYYY-MM-DD>_<description>.sql
 src/schemaops/                      the tool
 ```
 
-`main.yaml`:
+All configuration files use the `.yaml` extension (`.gitlab-ci.yml` is GitLab's own fixed name). Unknown keys are rejected, so a typo is caught instead of silently ignored.
+
+`cluster.yaml`, one per cluster:
+
+```yaml
+cluster-name: trades
+description: Primary OLTP cluster for the trading platform.
+engine: mariadb              # mariadb | mysql
+version: "10.11"             # quoted, so 10.10 is not read as 10.1
+topology: primary-replica    # optional: standalone | primary-replica | galera
+dba-contact: "#dba-oncall"
+
+# Optional, non-secret connection details. Credentials never go here.
+environments:
+  dev:  {host: trades-dev.example.internal, port: 3306, tls-mode: verify-identity}
+  uat:  {host: trades-uat.example.internal, port: 3306, tls-mode: verify-identity}
+  prod: {host: trades-prod.example.internal, port: 3306, tls-mode: verify-identity}
+```
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `cluster-name` | Yes | Must equal the folder name; lower snake_case |
+| `description` | Yes | What the cluster is for |
+| `engine` | Yes | `mariadb` or `mysql` |
+| `version` | Yes | Server version, as quoted text |
+| `dba-contact` | Yes | Where to reach the DBA team about this cluster |
+| `topology` | No | `standalone`, `primary-replica` or `galera` |
+| `environments.<env>.host` | No | Server host name for `dev`, `uat` or `prod` |
+| `environments.<env>.port` | No | 1 to 65535; defaults to 3306 |
+| `environments.<env>.tls-mode` | No | `verify-identity` (default) or `verify-ca`; `required` and `disabled` only in `dev` |
+
+Rules for `cluster.yaml`:
+
+- **Every cluster folder needs one**, even before it has a schema. Create it with `schemaops new-cluster`.
+- **No credentials.** A `user`, `password`, `token` or similar key is a governance error. Credentials stay in CI/CD variables.
+- **The `environments` block is optional.** Without it, set `SCHEMAOPS_<CLUSTER>_<ENV>_HOST` (and `_PORT`, `_TLS_MODE` if needed) as variables. With both, the variable wins.
+- **It is owned by the DBA team.** The host decides where credentials are sent, so `CODEOWNERS` assigns `/clusters/*/cluster.yaml` to the DBA team, and an existing `cluster.yaml` cannot be edited in the same merge request as a migration. A brand-new one may arrive together with the cluster's first schema.
+- **`engine`, `version` and `topology` are descriptive today.** They are validated and reviewable, but do not yet change how migrations run.
+
+`schema.yaml`, one per schema:
 
 ```yaml
 cluster-name: trades
 schema-name: accounts
 owner: trades-team
 description: Accounts schema for managing user accounts for daily trades.
-contact: "#trades-db"        # optional
+# Optional:
+owner-group: "@acme/trades-team"   # GitLab group; must own the schema's folder in CODEOWNERS
+contact: "#trades-db"
+escalation-contact: "trades-oncall@example.com"
+status: active                     # active | frozen | retired; frozen and retired accept no new migrations
+tier: 1                            # 1 (most critical) to 3; tier 1 needs DBA approval for PROD changes
+data-classification: confidential  # public | internal | confidential | restricted; shown to reviewers
 ```
 
-`environments/dev.yaml`:
+`environments/dev.yaml`, one per schema and environment:
 
 ```yaml
 cluster-name: trades
@@ -45,12 +92,19 @@ migrations:                  # oldest first; add at the end only
   - 2026-11-20_add_users_display_name.sql
 ```
 
+Applied status, timestamps and checksums are deliberately not kept in these files: they live in each database's `_schemaops_history` table, and a copy in Git would drift.
+
 The first migration of every schema is `<date>_initial_dump.sql`: a structure-only dump (`mysqldump --no-data --skip-add-drop-table --skip-comments`). On an empty schema it is executed; on an existing schema it is recorded as the baseline without being run.
 
 ## Developer workflow
 
 ```bash
 pip install -e ".[dev]"
+
+# 0. Once per cluster, then once per schema (DBA team and owning team)
+schemaops new-cluster --cluster trades --description "Primary OLTP cluster" --version 10.11 --dba-contact "#dba-oncall"
+schemaops new-schema --cluster trades --schema accounts --owner trades-team --description "User accounts" \
+  --tier 1 --data-classification confidential --initial-dump accounts_schema.sql
 
 # 1. DEV: create the migration, write one statement in it, open a merge request
 schemaops new-migration --cluster trades --schema accounts --name add_users_display_name
@@ -63,7 +117,7 @@ schemaops promote --cluster trades --schema accounts --to uat
 schemaops promote --cluster trades --schema accounts --to prod
 ```
 
-`promote` copies the file to the next environment's folder and registers it. Onboard a new schema with `schemaops new-schema`.
+`promote` copies the file to the next environment's folder and registers it. Onboard a cluster with `schemaops new-cluster`, then each schema with `schemaops new-schema`.
 
 | Command | Purpose |
 | --- | --- |
@@ -73,7 +127,7 @@ schemaops promote --cluster trades --schema accounts --to prod
 | `check-mr` | Everything a merge request must pass |
 | `plan` / `deploy` / `status` | Preview, apply and inspect migrations in one environment |
 | `mark-applied` | DBA only: record a change applied by hand |
-| `new-schema` / `new-migration` / `promote` | Scaffolding |
+| `new-cluster` / `new-schema` / `new-migration` / `promote` | Scaffolding |
 
 ## Governance checks
 
@@ -81,7 +135,9 @@ Repository state (`validate`, and again before every deployment):
 
 | Check | Enforces |
 | --- | --- |
-| `MAIN_CONFIG` | `main.yaml` exists, is complete and matches its folder |
+| `CLUSTER_CONFIG` | `cluster.yaml` exists, is complete, matches its folder, and holds valid connection details and no credentials |
+| `SCHEMA_CONFIG` | `schema.yaml` exists, is complete, matches its folder, and its optional fields have allowed values |
+| `OWNERSHIP` | `owner-group` is a GitLab group and owns the schema's folder in `CODEOWNERS` |
 | `ENV_CONFIG` | `dev.yaml`, `uat.yaml` and `prod.yaml` exist and match their folder and environment |
 | `REGISTRATION` | Every migration file is registered, every registered file exists, no duplicates |
 | `FILE_NAME` | `YYYY-MM-DD_<lower_snake_description>.sql` with a real date |
@@ -99,9 +155,10 @@ Merge request (`check-mr`, compared with the target branch):
 | `APPEND_ONLY` | Environment files only gain entries at the end |
 | `ONE_ENVIRONMENT` | A merge request adds migrations to one environment only |
 | `PROMOTION` | A migration enters UAT (PROD) only if it is already merged for DEV (UAT) on the target branch |
-| `SEPARATE_CHANGES` | Migrations are not mixed with framework, policy or pipeline changes |
+| `SEPARATE_CHANGES` | Migrations are not mixed with framework, policy or pipeline changes, or with edits to an existing `cluster.yaml` |
+| `FROZEN` | A schema with `status: frozen` or `retired` accepts no new migrations |
 | Deployment evidence | The previous environment's migration history shows the migration as deployed |
-| DBA approval | A DBA has approved any change to a protected table, a table over the size limit, or any new UNIQUE index |
+| DBA approval | A DBA has approved any change to a protected table, a table over the size limit, any new UNIQUE index, or any PROD change to a tier 1 schema |
 
 `check-mr` also posts **the plan** as a comment on the merge request and updates it on every run: each migration, how it will run, the table's current size, and how its deployment went in the previous environment. Set `SCHEMAOPS_MR_COMMENT=1` (the pipeline does); `--report FILE` writes the same Markdown to a file. The table size shows as "unknown" unless the read-only account can see the table's metadata.
 
@@ -190,11 +247,13 @@ Credentials are read only from environment variables and are never logged. For c
 
 | Variable | Notes |
 | --- | --- |
-| `SCHEMAOPS_TRADES_PROD_HOST`, `_PORT` | Port defaults to 3306 |
 | `SCHEMAOPS_TRADES_PROD_USER`, `_PASSWORD` | Migration account |
-| `SCHEMAOPS_TRADES_PROD_TLS_MODE` | `verify-identity` (default), `verify-ca`; `required` and `disabled` are accepted in DEV only |
+| `SCHEMAOPS_TRADES_PROD_HOST`, `_PORT` | Optional if `cluster.yaml` lists them; port defaults to 3306 |
+| `SCHEMAOPS_TRADES_PROD_TLS_MODE` | Optional. `verify-identity` (default), `verify-ca`; `required` and `disabled` are accepted in DEV only |
 | `SCHEMAOPS_TRADES_PROD_TLS_CA` | CA certificate path (GitLab "File" variable) |
 | `SCHEMAOPS_TRADES_UAT_RO_USER`, `_RO_PASSWORD` | Read-only history account, used by the next environment to verify deployment |
+
+Host, port and TLS mode are not secrets and can be listed per environment in `cluster.yaml`, where they are reviewable; a variable, when set, wins. Because the host decides where credentials are sent, `cluster.yaml` is owned by the DBA team in `CODEOWNERS` and an existing one cannot be changed in the same merge request as a migration. If you prefer to keep host names out of Git, leave `environments` out and use the variables.
 
 The configuration is validated before any connection: host, port, TLS mode, CA file, and `root`/`admin` accounts are refused. Suggested grants:
 
@@ -209,7 +268,7 @@ GRANT SELECT ON accounts._schemaops_history TO 'schemaops_prod_ro'@'%';
 
 ## GitLab setup
 
-1. Protect the default branch; allow merges only through approved merge requests; enable "Require approval from code owners" and adapt `CODEOWNERS`.
+1. Protect the default branch; allow merges only through approved merge requests; enable "Require approval from code owners" and adapt `CODEOWNERS`, including the DBA team's ownership of `/clusters/*/cluster.yaml`.
 2. Create environments `dev`, `uat`, `prod`; make `prod` (and ideally `uat`) a protected environment.
 3. Add the connection variables as **protected**, **masked**, **environment-scoped** CI/CD variables. Protected variables are only exposed to pipelines on protected branches, so merge request pipelines never receive deployment credentials.
 4. Give merge request pipelines only: the DEV and UAT `_HOST` and `_RO_*` variables (unprotected), and `SCHEMAOPS_GITLAB_TOKEN`, a project access token used to read labels and approvals and to post the plan. Give it the **Reporter** role and the `api` scope: enough to comment, not enough to push or merge. With `read_api` only, everything works except the plan comment.

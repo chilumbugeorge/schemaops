@@ -2,7 +2,8 @@
 
     schemaops.yaml                       framework settings (optional)
     policy/protected_tables.yaml         hot and large tables
-    clusters/<cluster>/<schema>/main.yaml
+    clusters/<cluster>/cluster.yaml      facts shared by every schema on the cluster
+    clusters/<cluster>/<schema>/schema.yaml
     clusters/<cluster>/<schema>/environments/<env>.yaml
     clusters/<cluster>/<schema>/migrations/<env>/<YYYY-MM-DD>_<description>.sql
 """
@@ -164,8 +165,15 @@ class Schema:
         return f"{self.cluster}/{self.name}"
 
     @property
-    def main_file(self) -> Path:
-        return self.path / "main.yaml"
+    def config_file(self) -> Path:
+        return self.path / "schema.yaml"
+
+    def config(self) -> dict[str, Any]:
+        """schema.yaml, or an empty mapping if it is missing or invalid (governance reports that)."""
+        try:
+            return load_yaml(self.config_file)
+        except ConfigError:
+            return {}
 
     def environment_file(self, environment: str) -> Path:
         return self.path / "environments" / f"{environment}.yaml"
@@ -184,6 +192,28 @@ class Schema:
     def migrations(self, environment: str) -> list[Migration]:
         directory = self.migrations_dir(environment)
         return [Migration(name, directory / name) for name in self.registered(environment)]
+
+
+def discover_clusters(settings: Settings) -> list[Path]:
+    if not settings.clusters_dir.is_dir():
+        return []
+    return [
+        path for path in sorted(settings.clusters_dir.iterdir()) if path.is_dir() and not path.name.startswith(".")
+    ]
+
+
+def cluster_connection(settings: Settings, cluster: str, environment: str) -> dict[str, str]:
+    """Non-secret connection details from cluster.yaml: host, port, tls-mode. Empty if absent."""
+    path = settings.clusters_dir / cluster / "cluster.yaml"
+    if not path.is_file():
+        return {}
+    try:
+        entry = (load_yaml(path).get("environments") or {}).get(environment) or {}
+    except ConfigError:
+        return {}
+    if not isinstance(entry, dict):
+        return {}
+    return {key: str(entry[key]) for key in ("host", "port", "tls-mode") if entry.get(key) is not None}
 
 
 def discover_schemas(settings: Settings) -> list[Schema]:

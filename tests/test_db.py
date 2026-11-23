@@ -92,3 +92,18 @@ def test_client_options_file_is_private_and_escaped(tmp_path: Path):
     text = path.read_text()
     assert 'password="s3cr3t\\"prod\\\\"' in text
     assert "ssl-verify-server-cert" in text and "ssl-ca=" in text
+
+
+def test_cluster_yaml_supplies_non_secret_details_and_variables_override_them():
+    credentials = {"SCHEMAOPS_TRADES_DEV_USER": "schemaops_dev", "SCHEMAOPS_TRADES_DEV_PASSWORD": "s3cr3t-dev"}
+    defaults = {"host": "from-yaml.internal", "port": "3307", "tls-mode": "verify-ca"}
+    config = ConnectionConfig.from_env("trades", "dev", environ=credentials, defaults=defaults)
+    assert (config.host, config.port, config.tls_mode) == ("from-yaml.internal", 3307, "verify-ca")
+
+    overridden = {**credentials, "SCHEMAOPS_TRADES_DEV_HOST": "from-variable.internal", "SCHEMAOPS_TRADES_DEV_PORT": "3308"}
+    config = ConnectionConfig.from_env("trades", "dev", environ=overridden, defaults=defaults)
+    assert (config.host, config.port) == ("from-variable.internal", 3308)
+
+    with pytest.raises(ConfigError, match="tls-mode|TLS_MODE"):  # cluster.yaml cannot weaken TLS outside DEV
+        prod = {"SCHEMAOPS_TRADES_PROD_USER": "u", "SCHEMAOPS_TRADES_PROD_PASSWORD": "p"}
+        ConnectionConfig.from_env("trades", "prod", environ=prod, defaults={"host": "db", "tls-mode": "disabled"})

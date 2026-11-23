@@ -22,13 +22,27 @@ from schemaops.repo import (
     NAME_RE,
     Schema,
     Settings,
+    discover_clusters,
     discover_schemas,
     load_protected_tables,
     load_yaml,
     previous_environment,
 )
 
-MAIN_KEYS = ("cluster-name", "schema-name", "owner", "description")
+SCHEMA_KEYS = ("cluster-name", "schema-name", "owner", "description")
+SCHEMA_OPTIONAL = {
+    "owner-group": None,  # GitLab group that owns the schema, for example @acme/trades-team
+    "contact": None,
+    "escalation-contact": None,
+    "tier": (1, 2, 3),  # 1 is the most critical
+    "data-classification": ("public", "internal", "confidential", "restricted"),
+    "status": ("active", "frozen", "retired"),
+}
+CLUSTER_KEYS = ("cluster-name", "description", "engine", "version", "dba-contact")
+CLUSTER_OPTIONAL = ("topology", "environments")
+ENGINES = ("mariadb", "mysql")
+TOPOLOGIES = ("standalone", "primary-replica", "galera")
+SECRET_KEYS = ("user", "username", "password", "passwd", "secret", "token")
 
 
 @dataclass(frozen=True)
@@ -65,24 +79,109 @@ def _relative(settings: Settings, path: Path) -> str:
 
 
 def _check_main(settings: Settings, schema: Schema) -> list[Issue]:
-    where = _relative(settings, schema.main_file)
-    if not schema.main_file.is_file():
-        return [Issue("MAIN_CONFIG", where, "main.yaml is missing. Every schema needs one.")]
+    where = _relative(settings, schema.config_file)
+    if not schema.config_file.is_file():
+        legacy = " Rename main.yaml to schema.yaml." if (schema.path / "main.yaml").is_file() else ""
+        return [Issue("SCHEMA_CONFIG", where, f"schema.yaml is missing. Every schema needs one.{legacy}")]
     try:
-        data = load_yaml(schema.main_file)
+        data = load_yaml(schema.config_file)
     except ConfigError as exc:
-        return [Issue("MAIN_CONFIG", where, str(exc))]
+        return [Issue("SCHEMA_CONFIG", where, str(exc))]
     issues = [
-        Issue("MAIN_CONFIG", where, f"`{key}` is required and must not be empty.")
-        for key in MAIN_KEYS
+        Issue("SCHEMA_CONFIG", where, f"`{key}` is required and must not be empty.")
+        for key in SCHEMA_KEYS
         if not str(data.get(key) or "").strip()
     ]
     for key, expected in (("cluster-name", schema.cluster), ("schema-name", schema.name)):
         if data.get(key) and data[key] != expected:
-            issues.append(Issue("MAIN_CONFIG", where, f"`{key}` is `{data[key]}` but the folder says `{expected}`."))
+            issues.append(Issue("SCHEMA_CONFIG", where, f"`{key}` is `{data[key]}` but the folder says `{expected}`."))
     for value in (schema.cluster, schema.name):
         if not NAME_RE.match(value):
-            issues.append(Issue("MAIN_CONFIG", where, f"Folder name `{value}` must be lower snake_case."))
+            issues.append(Issue("SCHEMA_CONFIG", where, f"Folder name `{value}` must be lower snake_case."))
+    for key in data:
+        if key not in SCHEMA_KEYS and key not in SCHEMA_OPTIONAL:
+            issues.append(Issue("SCHEMA_CONFIG", where, f"Unknown key `{key}`. Allowed: {', '.join([*SCHEMA_KEYS, *SCHEMA_OPTIONAL])}."))
+    for key, allowed in SCHEMA_OPTIONAL.items():
+        if allowed and key in data and data[key] not in allowed:
+            issues.append(Issue("SCHEMA_CONFIG", where, f"`{key}` must be one of {', '.join(str(v) for v in allowed)} (found `{data[key]}`)."))
+    issues.extend(_check_ownership(settings, schema, data))
+    return issues
+
+
+def _check_ownership(settings: Settings, schema: Schema, data: dict[str, object]) -> list[Issue]:
+    """`owner-group` must be a GitLab group and, if CODEOWNERS exists, own the schema's folder there."""
+    group = data.get("owner-group")
+    if not group:
+        return []
+    where = _relative(settings, schema.config_file)
+    if not isinstance(group, str) or not group.startswith("@") or " " in group:
+        return [Issue("OWNERSHIP", where, f"`owner-group` must be a GitLab group such as @acme/trades-team (found `{group}`).")]
+    codeowners = settings.root / "CODEOWNERS"
+    if not codeowners.is_file():
+        return []
+    folder = f"/{settings.clusters_root}/{schema.cluster}/{schema.name}/"
+    for line in codeowners.read_text(encoding="utf-8").splitlines():
+        parts = line.split("#")[0].split()
+        if parts and parts[0] == folder and group in parts[1:]:
+            return []
+    return [Issue("OWNERSHIP", "CODEOWNERS", f"Add `{folder} {group}` so the owning group must approve changes to {schema.label}.")]
+
+
+def check_cluster(settings: Settings, path: Path) -> list[Issue]:
+    """Validate clusters/<cluster>/cluster.yaml."""
+    from schemaops.db import HOST_RE, STRICT_TLS_MODES, TLS_MODES
+
+    config = path / "cluster.yaml"
+    where = _relative(settings, config)
+    if not config.is_file():
+        return [Issue("CLUSTER_CONFIG", where, "cluster.yaml is missing. Every cluster needs one (`schemaops new-cluster`).")]
+    try:
+        data = load_yaml(config)
+    except ConfigError as exc:
+        return [Issue("CLUSTER_CONFIG", where, str(exc))]
+
+    def issue(message: str) -> Issue:
+        return Issue("CLUSTER_CONFIG", where, message)
+
+    issues = [issue(f"`{key}` is required and must not be empty.") for key in CLUSTER_KEYS if not str(data.get(key) or "").strip()]
+    if data.get("cluster-name") and data["cluster-name"] != path.name:
+        issues.append(issue(f"`cluster-name` is `{data['cluster-name']}` but the folder says `{path.name}`."))
+    if not NAME_RE.match(path.name):
+        issues.append(issue(f"Folder name `{path.name}` must be lower snake_case."))
+    if data.get("engine") and data["engine"] not in ENGINES:
+        issues.append(issue(f"`engine` must be one of {', '.join(ENGINES)} (found `{data['engine']}`)."))
+    if "version" in data and not isinstance(data["version"], str):
+        issues.append(issue('`version` must be quoted text such as "10.11", so that 10.10 is not read as 10.1.'))
+    if data.get("topology") and data["topology"] not in TOPOLOGIES:
+        issues.append(issue(f"`topology` must be one of {', '.join(TOPOLOGIES)} (found `{data['topology']}`)."))
+    for key in data:
+        if key not in CLUSTER_KEYS and key not in CLUSTER_OPTIONAL:
+            issues.append(issue(f"Unknown key `{key}`. Allowed: {', '.join([*CLUSTER_KEYS, *CLUSTER_OPTIONAL])}."))
+
+    environments = data.get("environments") or {}
+    if not isinstance(environments, dict):
+        return [*issues, issue("`environments` must map dev, uat and prod to connection details.")]
+    for environment, entry in environments.items():
+        if environment not in ENVIRONMENTS:
+            issues.append(issue(f"Unknown environment `{environment}`. Allowed: {', '.join(ENVIRONMENTS)}."))
+            continue
+        if not isinstance(entry, dict):
+            issues.append(issue(f"`environments.{environment}` must be a mapping with host, port and tls-mode."))
+            continue
+        for key in entry:
+            if str(key).lower() in SECRET_KEYS:
+                issues.append(issue(f"`environments.{environment}.{key}`: credentials must never be stored in Git. Use CI/CD variables."))
+            elif key not in ("host", "port", "tls-mode"):
+                issues.append(issue(f"Unknown key `environments.{environment}.{key}`. Allowed: host, port, tls-mode."))
+        if "host" in entry and not HOST_RE.match(str(entry["host"])):
+            issues.append(issue(f"`environments.{environment}.host` is not a valid host name."))
+        if "port" in entry and not (isinstance(entry["port"], int) and 1 <= entry["port"] <= 65535):
+            issues.append(issue(f"`environments.{environment}.port` must be a number between 1 and 65535."))
+        mode = entry.get("tls-mode")
+        if mode is not None and mode not in TLS_MODES:
+            issues.append(issue(f"`environments.{environment}.tls-mode` must be one of {', '.join(TLS_MODES)}."))
+        elif mode is not None and environment != "dev" and mode not in STRICT_TLS_MODES:
+            issues.append(issue(f"`environments.{environment}.tls-mode` must verify the server certificate outside DEV."))
     return issues
 
 
@@ -155,8 +254,9 @@ def _check_environment(settings: Settings, schema: Schema, environment: str) -> 
     return issues, registered
 
 
-def check_schema(settings: Settings, schema: Schema) -> list[Issue]:
-    issues = _check_main(settings, schema)
+def check_schema(settings: Settings, schema: Schema, *, with_cluster: bool = True) -> list[Issue]:
+    issues = check_cluster(settings, schema.path.parent) if with_cluster else []
+    issues += _check_main(settings, schema)
     registered: dict[str, list[str]] = {}
     for environment in ENVIRONMENTS:
         found, registered[environment] = _check_environment(settings, schema, environment)
@@ -199,8 +299,11 @@ def check_repository(settings: Settings, schemas: list[Schema] | None = None) ->
             issues.append(
                 Issue("POLICY", settings.protected_tables_file, f"Protected table {cluster}.{schema_name}.{table} refers to an unknown schema.")
             )
+    if schemas is None:
+        for cluster in discover_clusters(settings):
+            issues.extend(check_cluster(settings, cluster))
     for schema in schemas if schemas is not None else discover_schemas(settings):
-        issues.extend(check_schema(settings, schema))
+        issues.extend(check_schema(settings, schema, with_cluster=schemas is not None))
     return issues
 
 
@@ -292,6 +395,18 @@ def check_merge_request(settings: Settings, base: str) -> tuple[list[Issue], lis
             )
         )
 
+    # A frozen or retired schema accepts no new migrations.
+    for schema in {item.schema for item in added}:
+        status = schema.config().get("status", "active")
+        if status in ("frozen", "retired"):
+            issues.append(
+                Issue(
+                    "FROZEN",
+                    _relative(settings, schema.config_file),
+                    f"{schema.label} is {status}: no new migrations are accepted. Its owners must set `status: active` first, in a separate merge request.",
+                )
+            )
+
     # A promotion is only valid if the previous environment's merge request is already merged.
     for item in added:
         lower = previous_environment(item.environment)
@@ -306,8 +421,12 @@ def check_merge_request(settings: Settings, base: str) -> tuple[list[Issue], lis
             )
 
     if added:
+        # cluster.yaml decides where credentials are sent, so only a brand-new one may ride along.
         outside = sorted(
-            path for _status, path in changed if not PurePosixPath(path).is_relative_to(clusters)
+            path
+            for status, path in changed
+            if not PurePosixPath(path).is_relative_to(clusters)
+            or (PurePosixPath(path).name == "cluster.yaml" and status != "A")
         )
         if outside:
             issues.append(

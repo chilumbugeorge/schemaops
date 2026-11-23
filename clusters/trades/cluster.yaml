@@ -1,0 +1,14 @@
+# Facts shared by every schema on the trades cluster. Owned by the DBA team.
+cluster-name: trades
+description: Primary OLTP cluster for the trading platform.
+engine: mariadb              # mariadb | mysql
+version: "10.11"
+topology: primary-replica    # standalone | primary-replica | galera
+dba-contact: "#dba-oncall"
+
+# Optional, non-secret connection details. Credentials never go here: they stay in
+# CI/CD variables. A SCHEMAOPS_TRADES_<ENV>_HOST variable, when set, wins.
+# environments:
+#   dev:  {host: trades-dev.example.internal, port: 3306, tls-mode: verify-identity}
+#   uat:  {host: trades-uat.example.internal, port: 3306, tls-mode: verify-identity}
+#   prod: {host: trades-prod.example.internal, port: 3306, tls-mode: verify-identity}

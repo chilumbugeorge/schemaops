@@ -15,13 +15,13 @@ def test_valid_repository_has_no_issues(repo: Repo):
 
 
 def test_missing_configuration_files(repo: Repo):
-    repo.schema.main_file.unlink()
+    repo.schema.config_file.unlink()
     repo.schema.environment_file("uat").unlink()
-    assert {"MAIN_CONFIG", "ENV_CONFIG"} <= checks(repo)
+    assert {"SCHEMA_CONFIG", "ENV_CONFIG"} <= checks(repo)
 
 
 def test_configuration_must_match_its_folder(repo: Repo):
-    repo.schema.main_file.write_text("cluster-name: other\nschema-name: accounts\nowner: x\n")
+    repo.schema.config_file.write_text("cluster-name: other\nschema-name: accounts\nowner: x\n")
     issues = [issue.message for issue in governance.check_repository(repo.settings)]
     assert any("`cluster-name` is `other`" in message for message in issues)
     assert any("`description` is required" in message for message in issues)
@@ -136,3 +136,98 @@ def test_migrations_cannot_be_combined_with_policy_or_framework_changes(git_repo
     git_repo.add("dev", "2026-11-20_a.sql", ALTER)
     (git_repo.root / "policy" / "protected_tables.yaml").write_text("protected-tables: []\n")
     assert "SEPARATE_CHANGES" in mr(git_repo, base)[0]
+
+
+# ------------------------------------------------------- cluster and schema files
+
+
+def messages(repo: Repo) -> list[str]:
+    return [issue.format() for issue in governance.check_repository(repo.settings)]
+
+
+def test_every_cluster_needs_a_valid_cluster_yaml(repo: Repo):
+    repo.cluster_file.unlink()
+    assert any("[CLUSTER_CONFIG] cluster.yaml is missing" in message for message in messages(repo))
+
+    repo.cluster_file.write_text(
+        "cluster-name: other\ndescription: x\nengine: oracle\nversion: 10.11\ntopology: ring\nwindow: sunday\n"
+        "environments:\n  qa: {host: a}\n  dev: {host: 'bad host', port: 99999, tls-mode: maybe, user: app}\n"
+        "  prod: {host: db-prod.internal, tls-mode: disabled}\n"
+    )
+    found = "\n".join(messages(repo))
+    for expected in (
+        "`dba-contact` is required",
+        "`cluster-name` is `other` but the folder says `trades`",
+        "`engine` must be one of mariadb, mysql",
+        "`version` must be quoted text",
+        "`topology` must be one of",
+        "Unknown key `window`",
+        "Unknown environment `qa`",
+        "`environments.dev.host` is not a valid host name",
+        "`environments.dev.port` must be a number between 1 and 65535",
+        "`environments.dev.tls-mode` must be one of",
+        "`environments.dev.user`: credentials must never be stored in Git",
+        "`environments.prod.tls-mode` must verify the server certificate outside DEV",
+    ):
+        assert expected in found, expected
+
+
+def test_a_cluster_without_schemas_is_still_checked(repo: Repo):
+    (repo.root / "clusters" / "empty_cluster").mkdir()
+    assert any("clusters/empty_cluster/cluster.yaml" in message for message in messages(repo))
+
+
+def test_schema_yaml_optional_fields_are_validated(repo: Repo):
+    with repo.schema.config_file.open("a") as handle:
+        handle.write("tier: 5\nstatus: paused\ndata-classification: secret\nownr: typo\n")
+    found = "\n".join(messages(repo))
+    for expected in ("`tier` must be one of 1, 2, 3", "`status` must be one of active, frozen, retired",
+                     "`data-classification` must be one of", "Unknown key `ownr`"):  # fmt: skip
+        assert expected in found, expected
+
+
+def test_legacy_main_yaml_gets_a_rename_hint(repo: Repo):
+    repo.schema.config_file.rename(repo.schema.path / "main.yaml")
+    assert any("Rename main.yaml to schema.yaml" in message for message in messages(repo))
+
+
+def test_owner_group_must_own_the_schema_in_codeowners(repo: Repo):
+    with repo.schema.config_file.open("a") as handle:
+        handle.write('owner-group: "@acme/trades-team"\n')
+    assert messages(repo) == []  # no CODEOWNERS file: nothing to compare with
+
+    (repo.root / "CODEOWNERS").write_text("/src/ @acme/dba\n/clusters/trades/accounts/ @acme/someone-else\n")
+    assert any("[OWNERSHIP] Add `/clusters/trades/accounts/ @acme/trades-team`" in message for message in messages(repo))
+    (repo.root / "CODEOWNERS").write_text("/clusters/trades/accounts/   @acme/trades-team @acme/dba  # owners\n")
+    assert messages(repo) == []
+
+    repo.schema.config_file.write_text(repo.schema.config_file.read_text().replace('"@acme/trades-team"', "trades team"))
+    assert any("`owner-group` must be a GitLab group" in message for message in messages(repo))
+
+
+def test_frozen_and_retired_schemas_accept_no_new_migrations(git_repo: Repo):
+    with git_repo.schema.config_file.open("a") as handle:
+        handle.write("status: frozen\n")
+    base = git_repo.commit("freeze")
+    git_repo.add("dev", "2026-11-20_a.sql", ALTER)
+    assert "FROZEN" in mr(git_repo, base)[0]
+
+    git_repo.schema.config_file.write_text(git_repo.schema.config_file.read_text().replace("frozen", "active"))
+    base = git_repo.commit("thaw")
+    git_repo.add("dev", "2026-11-21_b.sql", ALTER)
+    assert mr(git_repo, base)[0] == set()
+
+
+def test_cluster_yaml_cannot_be_changed_together_with_migrations(git_repo: Repo):
+    base = git_repo.commit()
+    git_repo.add("dev", "2026-11-20_a.sql", ALTER)
+    with git_repo.cluster_file.open("a") as handle:
+        handle.write("environments:\n  prod: {host: somewhere-else.example.com}\n")
+    assert "SEPARATE_CHANGES" in mr(git_repo, base)[0]
+
+    # A brand-new cluster may arrive together with its first schema.
+    git_repo.git("checkout", "-q", "--", ".")
+    git_repo.git("clean", "-qfd")
+    fresh = Repo(git_repo.root, cluster="payments", schema="ledger")
+    fresh.add("dev", DUMP)
+    assert mr(git_repo, base)[0] == set()

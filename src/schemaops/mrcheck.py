@@ -46,6 +46,7 @@ class Report:
     rows: list[PlanRow] = field(default_factory=list)
     dba: list[str] = field(default_factory=list)
     promotion: list[str] = field(default_factory=list)
+    schemas: list[str] = field(default_factory=list)  # one line per schema touched
     blocked: list[str] = field(default_factory=list)  # blocking problems outside governance and lint
 
     @property
@@ -210,6 +211,17 @@ def run(
                         "; ".join(sizes) or "unknown", previous)  # fmt: skip
             )
 
+    # Tier 1 schemas: every change headed for a manual environment needs a DBA's approval.
+    for schema, environment in sorted({(item.schema, item.environment) for item in added}, key=lambda pair: pair[0].label):
+        if schema.config().get("tier") == 1 and environment in settings.manual_environments:
+            report.dba.append(f"{schema.label} is a tier 1 schema: {environment.upper()} changes need DBA approval")
+    report.schemas = [
+        f"{schema.label}: owner {config.get('owner', 'unknown')}, tier {config.get('tier', 'not set')}, "
+        f"data {config.get('data-classification', 'not classified')}"
+        for schema in sorted({item.schema for item in added}, key=lambda schema: schema.label)
+        for config in [schema.config()]
+    ]
+
     if report.dba:
         if request is None and not in_ci:
             report.dba.append("DBA approval will be required on the merge request (cannot be checked outside GitLab).")
@@ -278,6 +290,8 @@ def render_markdown(report: Report) -> str:
         ]
     else:
         lines.append("No new migrations in this merge request.")
+    if report.schemas:
+        lines += ["", "**Schemas**", *[f"- {_cell(line)}" for line in report.schemas]]
     if report.blocked:
         lines += ["", "**Blocked**", *[f"- {_cell(message)}" for message in report.blocked]]
     if report.issues:

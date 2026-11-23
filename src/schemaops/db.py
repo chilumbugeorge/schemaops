@@ -3,12 +3,15 @@
 Credentials come only from environment variables (GitLab protected CI variables
 in the pipeline) and are never written to logs. For cluster `trades` in `prod`:
 
-    SCHEMAOPS_TRADES_PROD_HOST       required
-    SCHEMAOPS_TRADES_PROD_PORT       default 3306
     SCHEMAOPS_TRADES_PROD_USER       required
     SCHEMAOPS_TRADES_PROD_PASSWORD   required
-    SCHEMAOPS_TRADES_PROD_TLS_MODE   verify-identity (default) | verify-ca | required | disabled
     SCHEMAOPS_TRADES_PROD_TLS_CA     path to the CA certificate (GitLab "File" variable)
+    SCHEMAOPS_TRADES_PROD_HOST       required unless cluster.yaml gives the host
+    SCHEMAOPS_TRADES_PROD_PORT       default 3306
+    SCHEMAOPS_TRADES_PROD_TLS_MODE   verify-identity (default) | verify-ca | required | disabled
+
+Host, port and TLS mode are not secrets and may instead be listed per environment in
+clusters/<cluster>/cluster.yaml; a variable, when set, wins.
 
 `..._RO_USER` / `..._RO_PASSWORD` name a read-only account that may only read the
 migration history; a higher environment uses it to prove a migration was deployed.
@@ -60,31 +63,35 @@ class ConnectionConfig:
         connect_timeout: int = 10,
         statement_timeout: int = 60,
         environ: Mapping[str, str] | None = None,
+        defaults: Mapping[str, str] | None = None,
     ) -> ConnectionConfig:
+        """`defaults` are the non-secret details from cluster.yaml: host, port, tls-mode."""
         env = os.environ if environ is None else environ
+        known = defaults or {}
         prefix = variable_prefix(cluster, environment)
         role = "_RO" if read_only else ""
+        host = env.get(f"{prefix}_HOST") or known.get("host", "")
         missing = [
-            f"{prefix}{name}"
-            for name in ("_HOST", f"{role}_USER", f"{role}_PASSWORD")
-            if not env.get(f"{prefix}{name}")
+            f"{prefix}{name}" for name in (f"{role}_USER", f"{role}_PASSWORD") if not env.get(f"{prefix}{name}")
         ]
+        if not host:
+            missing.insert(0, f"{prefix}_HOST (or environments.{environment}.host in cluster.yaml)")
         if missing:
             raise ConfigError(
                 f"Missing connection variable(s) for {cluster}/{environment}: {', '.join(missing)}. "
-                "Set them as protected, environment-scoped CI/CD variables; never commit them."
+                "Set them as protected, environment-scoped CI/CD variables; never commit credentials."
             )
-        port = env.get(f"{prefix}_PORT", "3306")
+        port = env.get(f"{prefix}_PORT") or known.get("port", "3306")
         if not port.isdigit():
             raise ConfigError(f"{prefix}_PORT must be a number")
         config = cls(
             cluster=cluster,
             environment=environment,
-            host=env[f"{prefix}_HOST"],
+            host=host,
             port=int(port),
             user=env[f"{prefix}{role}_USER"],
             password=env[f"{prefix}{role}_PASSWORD"],
-            tls_mode=env.get(f"{prefix}_TLS_MODE", "verify-identity").lower(),
+            tls_mode=(env.get(f"{prefix}_TLS_MODE") or known.get("tls-mode", "verify-identity")).lower(),
             tls_ca=env.get(f"{prefix}_TLS_CA", ""),
             connect_timeout=connect_timeout,
             statement_timeout=statement_timeout,

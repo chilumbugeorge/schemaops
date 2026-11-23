@@ -1,0 +1,11 @@
+# Identity and ownership of the trades/accounts schema.
+cluster-name: trades
+schema-name: accounts
+owner: trades-team
+owner-group: "@your-group/trades-team"   # must own /clusters/trades/accounts/ in CODEOWNERS
+description: Accounts schema for managing user accounts for daily trades.
+contact: "#trades-db"
+escalation-contact: "trades-oncall@example.com"
+status: active                  # active | frozen | retired (frozen and retired accept no new migrations)
+tier: 1                         # 1 (most critical) to 3; tier 1 needs DBA approval for PROD
+data-classification: confidential   # public | internal | confidential | restricted

@@ -10,5 +10,8 @@
 /CODEOWNERS         @your-group/dba-team
 /pyproject.toml     @your-group/dba-team
 
+# cluster.yaml decides where credentials are sent: DBA team only.
+/clusters/*/cluster.yaml   @your-group/dba-team
+
 # Each schema is owned by its team. Add one line per schema when it is onboarded.
 /clusters/trades/accounts/   @your-group/trades-team
