@@ -1,0 +1,6 @@
+# Identity and ownership of the trades/accounts schema. Created once.
+cluster-name: trades
+schema-name: accounts
+owner: trades-team
+description: Accounts schema for managing user accounts for daily trades.
+contact: "#trades-db"

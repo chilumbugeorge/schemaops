@@ -1,0 +1,7 @@
+# Migrations applied to PROD for trades/accounts, oldest first.
+# Add new entries at the end only. Never edit or remove an existing entry.
+cluster-name: trades
+schema-name: accounts
+environment: prod
+migrations:
+  - 2026-11-15_initial_dump.sql

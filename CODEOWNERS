@@ -1,0 +1,14 @@
+# GitLab code owners. Enable "Require approval from code owners" on the protected default branch.
+# Replace the group paths with your own.
+
+# The framework, its policy and its pipeline: only the DBA / platform team may change them.
+/src/               @your-group/dba-team
+/tests/             @your-group/dba-team
+/policy/            @your-group/dba-team
+/schemaops.yaml     @your-group/dba-team
+/.gitlab-ci.yml     @your-group/dba-team
+/CODEOWNERS         @your-group/dba-team
+/pyproject.toml     @your-group/dba-team
+
+# Each schema is owned by its team. Add one line per schema when it is onboarded.
+/clusters/trades/accounts/   @your-group/trades-team

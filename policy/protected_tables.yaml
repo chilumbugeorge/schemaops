@@ -1,0 +1,12 @@
+# Hot and large tables.
+#
+# A merge request that changes one of these tables must be approved by the DBA team,
+# and in manual environments (PROD by default) the change is applied by hand by a DBA
+# and then recorded with `schemaops mark-applied`. schemaops never runs it automatically there.
+#
+# Maintained by the DBA team. Review the list when a table grows or becomes write-heavy.
+protected-tables:
+  - cluster: trades
+    schema: accounts
+    table: orders
+    reason: about 400 million rows and written on every trade

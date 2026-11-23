@@ -1,0 +1,7 @@
+# Migrations applied to UAT for trades/accounts, oldest first.
+# Add new entries at the end only. Never edit or remove an existing entry.
+cluster-name: trades
+schema-name: accounts
+environment: uat
+migrations:
+  - 2026-11-15_initial_dump.sql

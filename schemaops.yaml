@@ -1,0 +1,32 @@
+# schemaops framework settings. Every key is optional; the values below are the defaults.
+# Changes to this file, policy/ and .gitlab-ci.yml must be approved by the DBA team (see CODEOWNERS).
+
+clusters-root: clusters
+
+lint:
+  # Merge request label that accepts warn and advise findings. Errors can never be bypassed.
+  bypass-label: ignore-linting
+  # Finding levels that fail a merge request when the label is absent.
+  # Remove `advise` to make advice informational only.
+  blocking-without-label: [warn, advise]
+
+governance:
+  protected-tables-file: policy/protected_tables.yaml
+  # GitLab user names of the DBA team. One of them must approve any merge request
+  # that changes a protected table or adds a UNIQUE index.
+  dba-approvers: []
+  # Environments where changes to protected tables are applied by hand by the DBA team.
+  manual-environments: [prod]
+  # Require proof (the migration history of the previous environment) before promotion.
+  verify-previous-deployment: true
+
+connection:
+  connect-timeout: 10      # seconds
+  statement-timeout: 60    # seconds, for statements run directly (not through pt-osc)
+
+online-schema-change:
+  lock-wait-timeout: 5     # seconds a metadata lock may be waited for (maximum 5)
+  max-lag: 5               # pause the copy while replicas lag more than this
+  max-load: Threads_running=50
+  critical-load: Threads_running=200
+  chunk-time: 0.5

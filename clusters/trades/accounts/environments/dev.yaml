@@ -1,0 +1,8 @@
+# Migrations applied to DEV for trades/accounts, oldest first.
+# Add new entries at the end only. Never edit or remove an existing entry.
+cluster-name: trades
+schema-name: accounts
+environment: dev
+migrations:
+  - 2026-11-15_initial_dump.sql
+  - 2026-11-20_add_users_display_name.sql
