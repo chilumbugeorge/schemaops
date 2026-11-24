@@ -28,6 +28,24 @@ class FakeTarget:
         self.facts: dict[str, TableFacts] = {}
         self.server = ServerFacts(oldest_transaction_seconds=0, free_bytes=None)
         self.instant = False  # whether the "server" can apply ALTERs as instant DDL
+        self.ddl = {name: f"CREATE TABLE `{name}` (id)" for name in self.known}
+        self.saved: dict[str, str] | None = None
+        self.left: list[str] = []
+
+    def definition(self, table: str) -> str | None:
+        return self.ddl.get(table.lower())
+
+    def definitions(self) -> dict[str, str]:
+        return dict(self.ddl)
+
+    def snapshot(self) -> dict[str, str] | None:
+        return None if self.saved is None else dict(self.saved)
+
+    def save_snapshot(self, definitions: dict[str, str]) -> None:
+        self.saved = dict(definitions)
+
+    def leftovers(self) -> list[str]:
+        return list(self.left)
 
     def inspect(self, table: str) -> TableFacts:
         return self.facts.get(table, TableFacts(exists=table in self.known, rows=10, size_bytes=16384))
@@ -54,6 +72,7 @@ class FakeTarget:
     def instant_alter(self, table: str, alter: str) -> bool:
         if self.instant:
             self.calls.append(("instant", f"{table}: {alter}"))
+            self.ddl[table.lower()] += f" + {alter}"
         return self.instant
 
     def execute(self, sql: str) -> None:
@@ -63,11 +82,13 @@ class FakeTarget:
         self.tables += 1
         if sql.upper().startswith("CREATE TABLE"):
             self.known.add(sql.split()[2].lower())
+            self.ddl[sql.split()[2].lower()] = sql.strip()
 
     def online_alter(self, table: str, alter: str) -> None:
         self.calls.append(("pt-osc", f"{table}: {alter}"))
         if self.fail_on and self.fail_on in alter:
             raise DeployError("boom")
+        self.ddl[table.lower()] = self.ddl.get(table.lower(), "") + f" + {alter}"
 
     def close(self) -> None:
         pass
@@ -426,3 +447,50 @@ def test_instant_alter_statement_and_error_handling():
         assert real_target(None, InstantConnection(errno)).instant_alter("users", "ADD INDEX i (a)") is False
     with pytest.raises(DeployError):  # for example a lock wait timeout: fail, never fall back to a copy
         real_target(None, InstantConnection(1205)).instant_alter("users", "ADD COLUMN a BIGINT NULL")
+
+
+# ------------------------------------------- results, structures and snapshots
+
+
+def test_applied_steps_carry_the_method_and_the_resulting_table_structure(repo: Repo):
+    repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
+    repo.add("dev", "2026-11-21_create_audit.sql", "CREATE TABLE audit (id BIGINT UNSIGNED PRIMARY KEY);\n")
+    repo.add("dev", "2026-11-22_drop_orders.sql", "DROP TABLE orders;\n")
+    target = FakeTarget(tables=2, rows=done(repo, "dev", DUMP))
+    target.instant = True
+    applied: list = []
+    deploy(repo.settings, repo.schema, "dev", target, applied=applied)
+    assert [(step.migration.name, step.result) for step in applied] == [
+        (ADD_COLUMN, "instant"),
+        ("2026-11-21_create_audit.sql", "direct"),
+        ("2026-11-22_drop_orders.sql", "direct"),
+    ]
+    assert applied[0].structures == (("users", "CREATE TABLE `users` (id) + ADD COLUMN display_name VARCHAR(64) NULL"),)
+    assert applied[1].structures[0][0] == "audit" and applied[2].structures == ()  # a dropped table has no structure
+
+
+def test_applied_steps_survive_a_later_failure_and_the_snapshot_is_still_recorded(repo: Repo):
+    repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
+    repo.add("dev", "2026-11-21_create_audit.sql", "CREATE TABLE audit (id BIGINT UNSIGNED PRIMARY KEY);\n")
+    target = FakeTarget(tables=2, rows=done(repo, "dev", DUMP), fail_on="CREATE TABLE audit")
+    applied: list = []
+    with pytest.raises(DeployError):
+        deploy(repo.settings, repo.schema, "dev", target, applied=applied)
+    assert [step.migration.name for step in applied] == [ADD_COLUMN]
+    assert target.saved is not None and "display_name" in target.saved["users"]
+
+
+def test_snapshot_is_recorded_on_first_run_and_after_manual_changes(repo: Repo):
+    target = FakeTarget(tables=2, rows=done(repo, "dev", DUMP))
+    assert target.saved is None
+    deploy(repo.settings, repo.schema, "dev", target)  # nothing pending, but no snapshot yet
+    assert target.saved == {"users": "CREATE TABLE `users` (id)", "orders": "CREATE TABLE `orders` (id)"}
+
+    name = "2026-11-20_add_orders_note.sql"
+    for environment in ("dev", "uat", "prod"):
+        repo.add(environment, name, "ALTER TABLE orders ADD COLUMN note VARCHAR(64) NULL;\n")
+    prod = FakeTarget(tables=2, rows=done(repo, "prod", DUMP))
+    prod.ddl["orders"] += " + note (added by hand)"
+    step = mark_applied(repo.settings, repo.schema, "prod", prod, name)
+    assert step.result == "manual" and "added by hand" in step.structures[0][1]
+    assert prod.saved is not None and "added by hand" in prod.saved["orders"]

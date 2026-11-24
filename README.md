@@ -11,6 +11,8 @@ Safety features, each described below:
 - **Automatic size escalation**: very large tables go to the DBA team even if nobody listed them.
 - **The plan on the merge request**: reviewers see how each migration will run before approving.
 - **Integration tests**: the deployment path is tested against a real MariaDB with the real `pt-online-schema-change`.
+- **Deployment feedback**: after a migration is applied, its merge request gets a comment with the resulting table structure.
+- **Nightly reconcile**: reports migrations left pending or failed, changes made outside migrations, and leftovers.
 
 ## Repository layout
 
@@ -24,6 +26,8 @@ clusters/<cluster>/
     environments/{dev,uat,prod}.yaml  migrations registered per environment
     migrations/{dev,uat,prod}/      <YYYY-MM-DD>_<description>.sql
 src/schemaops/                      the tool
+.gitlab-ci.yml, ci/common.yml       the pipeline
+Dockerfile                          the pipeline's runner image
 ```
 
 All configuration files use the `.yaml` extension (`.gitlab-ci.yml` is GitLab's own fixed name). Unknown keys are rejected, so a typo is caught instead of silently ignored.
@@ -126,6 +130,8 @@ schemaops promote --cluster trades --schema accounts --to prod
 | `rules` | Print the rule catalogue |
 | `check-mr` | Everything a merge request must pass |
 | `plan` / `deploy` / `status` | Preview, apply and inspect migrations in one environment |
+| `reconcile` | Report where Git and a database disagree; changes nothing |
+| `pipeline` | Write the per-cluster deployment child pipeline (used by CI) |
 | `mark-applied` | DBA only: record a change applied by hand |
 | `new-cluster` / `new-schema` / `new-migration` / `promote` | Scaffolding |
 
@@ -241,6 +247,29 @@ Just before each change, schemaops inspects the live table. `schemaops plan` sho
 
 A failed "every change" check stops the deployment before anything is changed or recorded, so a later run simply retries. The "table copy only" checks do not stand in the way of instant DDL. If the change turns out not to be instant and one of them fails, the migration is recorded as failed without the table being touched, and a DBA re-runs it with `--retry-failed` once the cause is resolved.
 
+### After a deployment
+
+When a migration is applied, schemaops comments on the merge request that introduced it: the environment, how the change ran (instant DDL, `pt-online-schema-change`, direct or manual), how long it took, and the table's structure as it now is (`SHOW CREATE TABLE`). A promotion merge request gets the comment for its own environment, so the DEV, UAT and PROD results each appear where that change was reviewed. A dropped table and the initial dump are reported without a structure.
+
+A deployment covering several schemas carries on past a failure: one schema's failed migration no longer stops the others. The job still fails, and a real failure always outranks "waiting for the DBA team" in the exit code.
+
+If `SCHEMAOPS_NOTIFY_WEBHOOK` is set to a Slack-compatible incoming webhook, a summary is posted to chat after each deployment, each `mark-applied`, and each reconcile run that finds something. A failed notification never fails the job.
+
+### Reconcile, drift and leftovers
+
+A deployment only looks at the schemas changed in that push, so a migration can be merged and never applied without anything noticing. `schemaops reconcile --env <env> --all` compares Git with each database and reports:
+
+| Finding | Meaning |
+| --- | --- |
+| `PENDING` | Registered in Git but not applied, with how long ago it was merged |
+| `FAILED` | A migration left in the `failed` or `running` state |
+| `CHECKSUM` | An applied migration whose file has since changed |
+| `UNKNOWN` | Applied in the database but no longer in Git |
+| `DRIFT` | A table created, removed or altered outside a migration, with the difference |
+| `LEFTOVER` | Tables such as `_users_new` or `pt_osc_*` triggers left by an interrupted online schema change |
+
+It only reads; it never applies or cleans up anything, and exits non-zero when it finds something. Drift is detected against a snapshot: after every deployment and every `mark-applied`, the definition of each table is stored in `_schemaops_snapshot` in that schema. Reconcile compares the live definitions with it, ignoring `AUTO_INCREMENT` counters. A schema deployed before this feature existed has no snapshot until its next deployment, and reports no drift until then.
+
 ## Credentials and security
 
 Credentials are read only from environment variables and are never logged. For cluster `trades` in `prod`:
@@ -266,15 +295,41 @@ GRANT PROCESS, REPLICATION SLAVE, REPLICATION MASTER ADMIN, SLAVE MONITOR ON *.*
 GRANT SELECT ON accounts._schemaops_history TO 'schemaops_prod_ro'@'%';
 ```
 
+schemaops keeps two tables of its own in each schema: `_schemaops_history` (what was applied, how and when) and `_schemaops_snapshot` (table definitions after the last deployment).
+
+## Pipeline
+
+`.gitlab-ci.yml` with the shared template `ci/common.yml`:
+
+| Job | Runs | Does |
+| --- | --- | --- |
+| `secret_detection` | Merge requests and merges | GitLab's secret scanner, backing the "no credentials in Git" rule |
+| `build-image` | When `Dockerfile` or `pyproject.toml` changes, or by hand with `BUILD_IMAGE=1` | Builds the runner image with `git`, `percona-toolkit` and the Python dependencies |
+| `unit-tests`, `integration-tests` | When the tool's code changes | The two test suites; the second uses a throwaway MariaDB service |
+| `check-mr` | Every merge request | Governance, lint, DBA approval, promotion evidence; posts the plan |
+| `generate-<env>` | Merge that touches that environment | Writes a child pipeline with one deployment job per changed cluster |
+| `deploy-dev`, `deploy-uat` | After `generate` | Run that child pipeline; clusters deploy independently, each in its own resource group |
+| `plan-prod` | Merge that touches PROD | Shows live table sizes and pre-flight results before anyone starts the deployment |
+| `deploy-prod` | Started by hand, after `plan-prod` | As `deploy-uat`, behind the protected `prod` environment |
+| `mark-applied` | By hand: `MARK_ENV`, `MARK_CLUSTER`, `MARK_SCHEMA`, `MARK_FILE` | Records a change the DBA team applied manually |
+| `retry-failed` | By hand: `RETRY_ENV`, `RETRY_CLUSTER`, `RETRY_SCHEMA` | Re-runs a failed migration after a DBA has checked the table |
+| `reconcile` | Pipeline schedule with `SCHEMAOPS_RECONCILE_ENV` | The reconcile report for that environment |
+
+The manual jobs are started from "Run pipeline" on the default branch with their variables set.
+
+**This pipeline has been checked for valid YAML and consistent job references, but it has not been run in GitLab.** Expect to adjust it on first use, in particular the child pipelines, the Docker-in-Docker image build and the secret detection template, which depend on your GitLab version and runners.
+
 ## GitLab setup
 
-1. Protect the default branch; allow merges only through approved merge requests; enable "Require approval from code owners" and adapt `CODEOWNERS`, including the DBA team's ownership of `/clusters/*/cluster.yaml`.
+1. Protect the default branch; allow merges only through approved merge requests; enable "Require approval from code owners" and adapt `CODEOWNERS`, including the DBA team's ownership of `/clusters/*/cluster.yaml`, `/ci/` and the pipeline files.
 2. Create environments `dev`, `uat`, `prod`; make `prod` (and ideally `uat`) a protected environment.
 3. Add the connection variables as **protected**, **masked**, **environment-scoped** CI/CD variables. Protected variables are only exposed to pipelines on protected branches, so merge request pipelines never receive deployment credentials.
-4. Give merge request pipelines only: the DEV and UAT `_HOST` and `_RO_*` variables (unprotected), and `SCHEMAOPS_GITLAB_TOKEN`, a project access token used to read labels and approvals and to post the plan. Give it the **Reporter** role and the `api` scope: enough to comment, not enough to push or merge. With `read_api` only, everything works except the plan comment.
+4. Give merge request pipelines only: the DEV and UAT `_HOST` and `_RO_*` variables (unprotected), and `SCHEMAOPS_GITLAB_TOKEN`, a project access token used to read labels and approvals and to post comments. Give it the **Reporter** role and the `api` scope: enough to comment, not enough to push or merge. With `read_api` only, everything works except the comments. The same token must be visible to default-branch pipelines for the post-deployment comment.
 5. Give the PROD deploy job the UAT `_RO_*` variables and the UAT job the DEV ones, so each can verify the previous deployment. Lower environments never receive higher-environment credentials.
 6. List the DBA team's GitLab user names under `governance.dba-approvers` in `schemaops.yaml`.
-7. The pipeline image needs `git` and `percona-toolkit`.
+7. Runner image: jobs start from `python:3.12-slim` and install `git` and `percona-toolkit` each time. To avoid that, run `build-image` once (it needs a runner that allows Docker-in-Docker), then set the CI/CD variable `SCHEMAOPS_IMAGE` to `$CI_REGISTRY_IMAGE/runner:latest`.
+8. Reconcile: create one pipeline schedule per environment on the default branch, each with the variable `SCHEMAOPS_RECONCILE_ENV` set to `dev`, `uat` or `prod`.
+9. Notifications (optional): set `SCHEMAOPS_NOTIFY_WEBHOOK` to a Slack-compatible incoming webhook URL, masked.
 
 After a DBA approves a merge request or a label is added, re-run the `check-mr` job. A promotion branch must be up to date with the target branch, because the checks compare against the commit the branch started from.
 
@@ -295,4 +350,4 @@ docker run -d --name schemaops-it -p 3306:3306 -e MARIADB_ROOT_PASSWORD=it-root-
 SCHEMAOPS_IT_HOST=127.0.0.1 SCHEMAOPS_IT_ROOT_PASSWORD=it-root-pw python -m pytest tests/integration
 ```
 
-It is skipped when `SCHEMAOPS_IT_HOST` is not set, and runs in the pipeline as the `integration-tests` job. It covers the full deploy cycle, instant DDL and the fallback to `pt-online-schema-change`, baselining, live table facts, pre-flight failures, the 5-second metadata lock limit, the deployment lock and the read-only account. It does not cover TLS connections or replica lag throttling; verify those against your own clusters.
+It is skipped when `SCHEMAOPS_IT_HOST` is not set, and runs in the pipeline as the `integration-tests` job. It covers the full deploy cycle, instant DDL and the fallback to `pt-online-schema-change`, baselining, live table facts, pre-flight failures, the 5-second metadata lock limit, the deployment lock, the read-only account, and the table structure, snapshot, drift and leftover detection. It does not cover TLS connections or replica lag throttling; verify those against your own clusters.

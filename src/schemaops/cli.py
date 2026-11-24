@@ -10,11 +10,13 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from schemaops import __version__, governance, log, mrcheck
+from schemaops import __version__, governance, log, mrcheck, notify
+from schemaops import reconcile as reconciler
 from schemaops.db import ConnectionConfig
 from schemaops.deploy import (
     HistoryRow,
     MariaDBTarget,
+    Step,
     TableFacts,
     deploy,
     mark_applied,
@@ -22,7 +24,7 @@ from schemaops.deploy import (
     verify_previous_environment,
 )
 from schemaops.errors import ConfigError, GovernanceError, ManualActionRequired, SchemaOpsError
-from schemaops.gitlab import MergeRequest
+from schemaops.gitlab import MergeRequest, Project
 from schemaops.lint.rules import RULES
 from schemaops.repo import (
     ENVIRONMENTS,
@@ -70,9 +72,10 @@ def _register(schema: Schema, environment: str, name: str) -> None:
 def _select_schemas(settings: Settings, args: argparse.Namespace) -> list[Schema]:
     if args.cluster and args.schema:
         return [find_schema(settings, args.cluster, args.schema)]
-    if args.cluster or args.schema:
-        raise ConfigError("Give both --cluster and --schema, or use --all / --changed-since.")
-    schemas = discover_schemas(settings)
+    if args.schema:
+        raise ConfigError("--schema needs --cluster.")
+    # --cluster alone narrows --all / --changed-since to one cluster.
+    schemas = [schema for schema in discover_schemas(settings) if not args.cluster or schema.cluster == args.cluster]
     changed_since = getattr(args, "changed_since", None)
     if changed_since and not changed_since.strip("0"):
         return schemas  # GitLab sends all zeros when there is no previous commit
@@ -90,7 +93,7 @@ def _select_schemas(settings: Settings, args: argparse.Namespace) -> list[Schema
         ]
     if getattr(args, "all", False):
         return schemas
-    raise ConfigError("Choose what to act on: --cluster and --schema, --all, or --changed-since REF.")
+    raise ConfigError("Choose what to act on: --cluster and --schema, --all, or --changed-since REF (optionally with --cluster).")
 
 
 def _target(settings: Settings, schema: Schema, environment: str, *, read_only: bool = False) -> MariaDBTarget:
@@ -212,6 +215,45 @@ def _guard_pipeline(environment: str) -> None:
         raise GovernanceError(f"{environment.upper()} deployments only run from a protected branch.")
 
 
+def _added_in(settings: Settings, path: Path) -> str:
+    """The commit that added a file to the repository, or an empty string."""
+    try:
+        return governance._git(settings, "log", "--diff-filter=A", "--format=%H", "-1", "--", str(path)).strip()
+    except SchemaOpsError:
+        return ""
+
+
+def _step_summary(step: Step) -> str:
+    how = {
+        "instant": "instant DDL",
+        "pt-osc": "pt-online-schema-change",
+        "direct": "a direct statement",
+        "baseline": "baseline (existing schema recorded, nothing executed)",
+        "manual": "manual change by the DBA team",
+    }.get(step.result, step.result)
+    took = f" in {step.seconds:.0f}s" if step.result in ("instant", "pt-osc", "direct") else ""
+    return f"`{step.migration.name}`: {how}{took}"
+
+
+def _announce(settings: Settings, schema: Schema, environment: str, steps: Sequence[Step]) -> None:
+    """Tell each merge request that its migration is deployed, with the resulting table structure."""
+    project = Project.from_env()
+    if project is None or not steps:
+        return
+    comments: dict[str, list[str]] = {}
+    for step in steps:
+        lines = [f"**{schema.label}** {_step_summary(step)}"]
+        for table, definition in step.structures:
+            lines += ["", f"Table `{table}` is now:", "", "```sql", definition, "```"]
+        commit = _added_in(settings, step.migration.path)
+        for iid in project.merge_requests_for_commit(commit) if commit else []:
+            comments.setdefault(iid, []).extend([*lines, ""])
+    for iid, lines in comments.items():
+        body = log.redact("\n".join([f"### schemaops: deployed to {environment.upper()}", "", *lines]))
+        if project.comment(iid, body):
+            logger.info("deployment posted to the merge request", extra={"merge_request": iid})
+
+
 def cmd_deploy(settings: Settings, args: argparse.Namespace) -> int:
     dry_run = args.command == "plan" or args.dry_run
     if not dry_run:
@@ -222,10 +264,14 @@ def cmd_deploy(settings: Settings, args: argparse.Namespace) -> int:
     if not schemas:
         _out(f"No schema has changes for {args.env.upper()}.")
         return 0
-    exit_code = 0
+    failure = 0  # exit code of the first hard failure
+    waiting = False  # some migration is waiting for the DBA team
+    summary: list[str] = []
     for schema in schemas:
-        target = _target(settings, schema, args.env)
+        applied: list[Step] = []
+        target = None
         try:
+            target = _target(settings, schema, args.env)
             steps = deploy(
                 settings,
                 schema,
@@ -234,21 +280,92 @@ def cmd_deploy(settings: Settings, args: argparse.Namespace) -> int:
                 lower_history=_lower_history(settings, schema, args.env),
                 dry_run=dry_run,
                 retry_failed=getattr(args, "retry_failed", False),
+                applied=applied,
             )
             verb = "would apply" if dry_run else "applied"
             _out(f"{schema.label} ({args.env.upper()}): {verb} {len(steps)} migration(s).")
             for step in steps:
-                _out(f"  {step.migration.name}  [{step.method}] {step.detail}")
+                _out(f"  {step.migration.name}  [{step.result or step.method}] {step.detail}")
                 for problem in step.problems:
                     _out(f"      PRE-FLIGHT: {problem}")
                 for problem in step.copy_problems:
                     _out(f"      PRE-FLIGHT (only if instant DDL is not possible): {problem}")
+            if steps and not dry_run:
+                summary.append(f"{schema.label}: applied {len(steps)} migration(s)")
         except ManualActionRequired as exc:
             _out(str(exc))
-            exit_code = max(exit_code, exc.exit_code)
+            summary.append(f"{schema.label}: WAITING FOR DBA. {exc}")
+            waiting = True
+        except SchemaOpsError as exc:
+            # One schema's failure must not stop the others; report it and carry on.
+            logger.error(str(exc))
+            summary.append(f"{schema.label}: FAILED. {str(exc).splitlines()[0]}")
+            failure = failure or exc.exit_code
+        finally:
+            if target is not None:
+                target.close()
+            if not dry_run:
+                _announce(settings, schema, args.env, applied)
+    if summary and not dry_run:
+        notify.send(f"schemaops {args.env.upper()} deployment\n" + "\n".join(f"- {line}" for line in summary))
+    # A real failure always wins: exit code 3 ("waiting for DBA") is only a warning in the pipeline.
+    return failure or (ManualActionRequired.exit_code if waiting else 0)
+
+
+def cmd_reconcile(settings: Settings, args: argparse.Namespace) -> int:
+    schemas = _select_schemas(settings, args)
+    report: list[str] = []
+    for schema in schemas:
+        try:
+            target = _target(settings, schema, args.env)
+        except SchemaOpsError as exc:
+            report.append(f"{schema.label}: UNREACHABLE {str(exc).splitlines()[0]}")
+            continue
+        try:
+            findings = reconciler.reconcile(settings, schema, args.env, target)
+        except SchemaOpsError as exc:
+            report.append(f"{schema.label}: UNREACHABLE {str(exc).splitlines()[0]}")
+            continue
         finally:
             target.close()
-    return exit_code
+        for finding in findings:
+            report.append(f"{schema.label}: {finding.kind} {finding.message}")
+            report.extend(f"    {line}" for line in finding.detail.splitlines())
+    for line in report:
+        _out(line)
+    problems = sum(1 for line in report if not line.startswith("    "))
+    _out(f"Reconciled {len(schemas)} schema(s) in {args.env.upper()}: {problems} finding(s).")
+    if problems:
+        headline = [line for line in report if not line.startswith("    ")]
+        notify.send(
+            f"schemaops reconcile {args.env.upper()}: {problems} finding(s)\n"
+            + "\n".join(f"- {line}" for line in headline[:20])
+        )
+    return 1 if problems else 0
+
+
+def cmd_pipeline(settings: Settings, args: argparse.Namespace) -> int:
+    """Write a GitLab child pipeline with one deployment job per cluster."""
+    clusters = sorted({schema.cluster for schema in _select_schemas(settings, args)})
+    since = args.changed_since or "0"
+    lines = ["# Generated by `schemaops pipeline`. Do not edit.", "include:", "  - local: ci/common.yml", "", "stages: [deploy]", ""]
+    for cluster in clusters:
+        lines += [
+            f"deploy-{cluster}-{args.env}:",
+            "  extends: .schemaops-deploy",
+            f"  environment: {args.env}",
+            f"  resource_group: schemaops-{cluster}-{args.env}",
+            "  variables:",
+            f'    SCHEMAOPS_ENV: "{args.env}"',
+            f'    SCHEMAOPS_CLUSTER: "{cluster}"',
+            f'    SCHEMAOPS_SINCE: "{since}"',
+            "",
+        ]
+    if not clusters:
+        lines += ["nothing-to-deploy:", "  stage: deploy", "  before_script: []", f'  script: ["echo No schema has changes for {args.env}."]', ""]
+    Path(args.output).write_text("\n".join(lines), encoding="utf-8")
+    _out(f"Wrote {args.output}: {len(clusters)} deployment job(s) ({', '.join(clusters) or 'none'}).")
+    return 0
 
 
 def cmd_status(settings: Settings, args: argparse.Namespace) -> int:
@@ -279,10 +396,12 @@ def cmd_mark_applied(settings: Settings, args: argparse.Namespace) -> int:
         verify_previous_environment(schema, args.env, [args.file], lower, {args.file: _sha(path)})
     target = _target(settings, schema, args.env)
     try:
-        mark_applied(settings, schema, args.env, target, args.file)
+        step = mark_applied(settings, schema, args.env, target, args.file)
     finally:
         target.close()
     _out(f"Recorded {args.file} as manually applied to {schema.label} ({args.env.upper()}).")
+    _announce(settings, schema, args.env, [step])
+    notify.send(f"schemaops {args.env.upper()}: {schema.label} `{args.file}` recorded as applied manually by the DBA team")
     return 0
 
 
@@ -449,6 +568,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_argument("--dry-run", action="store_true")
     sub.add_argument("--retry-failed", action="store_true", help="Retry a migration left failed or running, after a DBA check.")
     sub.set_defaults(run=cmd_deploy)
+
+    sub = commands.add_parser(
+        "reconcile", help="Report pending, failed or tampered migrations, schema drift and leftovers. Changes nothing."
+    )
+    scope_args(sub)
+    sub.set_defaults(run=cmd_reconcile)
+
+    sub = commands.add_parser("pipeline", help="Write a GitLab child pipeline with one deployment job per cluster.")
+    scope_args(sub)
+    sub.add_argument("--output", required=True, metavar="FILE")
+    sub.set_defaults(run=cmd_pipeline)
 
     sub = commands.add_parser("status", help="Show applied and pending migrations.")
     scope_args(sub)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -26,7 +27,7 @@ from typing import Any, Protocol
 
 from schemaops import log, sqlplan
 from schemaops.db import ConnectionConfig, connect
-from schemaops.errors import DeployError, GovernanceError, ManualActionRequired
+from schemaops.errors import DeployError, GovernanceError, ManualActionRequired, SchemaOpsError
 from schemaops.governance import check_schema
 from schemaops.repo import (
     Migration,
@@ -40,6 +41,23 @@ from schemaops.repo import (
 logger = log.get("deploy")
 
 HISTORY_TABLE = "_schemaops_history"
+SNAPSHOT_TABLE = "_schemaops_snapshot"
+OWN_TABLES = (HISTORY_TABLE, SNAPSHOT_TABLE)
+# What pt-online-schema-change leaves behind when it is interrupted.
+LEFTOVER_TABLE_RE = re.compile(r"^_+.+_(?:new|old)$")
+SNAPSHOT_DDL = f"""
+CREATE TABLE IF NOT EXISTS `{SNAPSHOT_TABLE}` (
+  table_name VARCHAR(64) NOT NULL,
+  definition MEDIUMTEXT NOT NULL,
+  captured_at DATETIME NOT NULL,
+  PRIMARY KEY (table_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+"""
+
+
+def normalize_definition(definition: str) -> str:
+    """A table definition without the parts that change through normal use."""
+    return re.sub(r" AUTO_INCREMENT=\d+", "", definition).strip()
 DONE = ("success", "baseline", "manual")
 # ER_UNKNOWN_ALTER_ALGORITHM, ER_ALTER_OPERATION_NOT_SUPPORTED, ER_ALTER_OPERATION_NOT_SUPPORTED_REASON
 NOT_INSTANT_ERRORS = (1800, 1845, 1846)
@@ -108,6 +126,11 @@ class Target(Protocol):
     def user_table_count(self) -> int: ...
     def inspect(self, table: str) -> TableFacts: ...
     def server_facts(self) -> ServerFacts: ...
+    def definition(self, table: str) -> str | None: ...
+    def definitions(self) -> dict[str, str]: ...
+    def snapshot(self) -> dict[str, str] | None: ...
+    def save_snapshot(self, definitions: dict[str, str]) -> None: ...
+    def leftovers(self) -> list[str]: ...
     def start(self, migration: Migration, method: str) -> None: ...
     def finish(self, migration: Migration, status: str, error: str = "", method: str = "") -> None: ...
     def execute(self, sql: str) -> None: ...
@@ -215,10 +238,64 @@ class MariaDBTarget:
     def user_table_count(self) -> int:
         rows = self._query(
             "SELECT COUNT(*) AS total FROM information_schema.tables "
-            "WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name <> %s",
-            (self.schema, HISTORY_TABLE),
+            "WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name NOT IN (%s, %s)",
+            (self.schema, *OWN_TABLES),
         )
         return int(rows[0]["total"])
+
+    def definition(self, table: str) -> str | None:
+        """SHOW CREATE TABLE for one table, or None if it does not exist."""
+        exists = self._query(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
+            (self.schema, table),
+        )
+        if not exists:
+            return None
+        quoted = "`" + table.replace("`", "``") + "`"
+        return str(self._query(f"SHOW CREATE TABLE {quoted}")[0]["Create Table"])
+
+    def definitions(self) -> dict[str, str]:
+        rows = self._query(
+            "SELECT table_name AS name FROM information_schema.tables "
+            "WHERE table_schema = %s AND table_type = 'BASE TABLE' AND table_name NOT IN (%s, %s) ORDER BY table_name",
+            (self.schema, *OWN_TABLES),
+        )
+        found = {str(row["name"]): self.definition(str(row["name"])) for row in rows}
+        return {name: text for name, text in found.items() if text is not None}
+
+    def snapshot(self) -> dict[str, str] | None:
+        """The schema as it was after the last deployment, or None if never recorded."""
+        exists = self._query(
+            "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s",
+            (self.schema, SNAPSHOT_TABLE),
+        )
+        if not exists:
+            return None
+        rows = self._query(f"SELECT table_name AS name, definition FROM `{SNAPSHOT_TABLE}`")
+        return {str(row["name"]): str(row["definition"]) for row in rows}
+
+    def save_snapshot(self, definitions: dict[str, str]) -> None:
+        self._query(SNAPSHOT_DDL)
+        self._query(f"DELETE FROM `{SNAPSHOT_TABLE}`")
+        for name, text in definitions.items():
+            self._query(
+                f"INSERT INTO `{SNAPSHOT_TABLE}` (table_name, definition, captured_at) VALUES (%s, %s, UTC_TIMESTAMP())",
+                (name, text),
+            )
+
+    def leftovers(self) -> list[str]:
+        """Tables and triggers an interrupted pt-online-schema-change run left behind."""
+        tables = self._query(
+            "SELECT table_name AS name FROM information_schema.tables WHERE table_schema = %s ORDER BY table_name",
+            (self.schema,),
+        )
+        triggers = self._query(
+            "SELECT trigger_name AS name FROM information_schema.triggers "
+            "WHERE trigger_schema = %s AND trigger_name LIKE 'pt\\_osc\\_%%' ORDER BY trigger_name",
+            (self.schema,),
+        )
+        found = [f"table `{row['name']}`" for row in tables if LEFTOVER_TABLE_RE.match(str(row["name"]))]
+        return found + [f"trigger `{row['name']}`" for row in triggers]
 
     def start(self, migration: Migration, method: str) -> None:
         actor = os.environ.get("GITLAB_USER_LOGIN") or getpass.getuser()
@@ -299,6 +376,10 @@ class Step:
     detail: str = ""
     problems: tuple[str, ...] = ()  # pre-flight failures; the step will not run while any remain
     copy_problems: tuple[str, ...] = ()  # failures that matter only if the table has to be copied
+    # Filled in once the step has been applied:
+    result: str = ""  # instant | pt-osc | direct | baseline | manual
+    seconds: float = 0.0
+    structures: tuple[tuple[str, str], ...] = ()  # (table, SHOW CREATE TABLE) after the change
 
 
 def oversized(settings: Settings, facts: TableFacts) -> str:
@@ -463,8 +544,13 @@ def deploy(
     lower_history: dict[str, HistoryRow] | None = None,
     dry_run: bool = False,
     retry_failed: bool = False,
+    applied: list[Step] | None = None,
 ) -> list[Step]:
-    """Apply (or, with dry_run, only report) the pending migrations. Returns the steps."""
+    """Apply (or, with dry_run, only report) the pending migrations. Returns the steps.
+
+    Each migration that is applied is appended to `applied` as it finishes, so the caller
+    still knows what succeeded when a later migration fails.
+    """
     issues = check_schema(settings, schema)
     if issues:
         raise GovernanceError(f"{schema.label} fails governance checks:\n" + "\n".join(issue.format() for issue in issues))
@@ -496,6 +582,44 @@ def deploy(
                     created.add(operation.table)
         return planned
 
+    done = applied if applied is not None else []
+    try:
+        _apply(settings, schema, environment, target, steps, server, done)
+    finally:
+        # Record what the schema looks like now, so later out-of-band changes can be detected.
+        try:
+            if done or target.snapshot() is None:
+                target.save_snapshot(target.definitions())
+        except SchemaOpsError as exc:
+            logger.warning("could not record the schema snapshot", extra={"schema": schema.label, "reason": str(exc)})
+    return steps
+
+
+def _structures(target: Target, operations: Sequence[sqlplan.Operation]) -> tuple[tuple[str, str], ...]:
+    """The definition of every table a migration created or changed, as it is afterwards."""
+    found: list[tuple[str, str]] = []
+    for operation in operations:
+        if operation.kind == sqlplan.DROP_TABLE:
+            continue
+        names = operation.tables[1::2] if operation.kind == sqlplan.RENAME_TABLE else [operation.name or operation.table]
+        for name in names:
+            text = target.definition(name)
+            if text is not None:
+                found.append((name, text))
+    return tuple(found)
+
+
+def _apply(
+    settings: Settings,
+    schema: Schema,
+    environment: str,
+    target: Target,
+    steps: list[Step],
+    server: ServerFacts,
+    done: list[Step],
+) -> None:
+    import time
+
     for index, step in enumerate(steps):
         # Checked just before each change, so it sees the tables earlier migrations created.
         step = steps[index] = preflight(settings, environment, step, target, server)
@@ -514,11 +638,13 @@ def deploy(
         logger.info("applying migration", extra=context)
         target.start(migration, step.method)
         used = step.method
+        operations = sqlplan.parse_operations(migration.read())
+        began = time.monotonic()
         try:
             if step.method == "baseline":
                 pass  # the schema already exists; record the dump as its starting point
             else:
-                for operation in sqlplan.parse_operations(migration.read()):
+                for operation in operations:
                     if operation.kind != sqlplan.ALTER_TABLE:
                         target.execute(operation.sql)
                         continue
@@ -540,10 +666,12 @@ def deploy(
             raise
         target.finish(migration, "baseline" if step.method == "baseline" else "success", method=used)
         logger.info("migration applied", extra={**context, "method": used})
-    return steps
+        structures = () if migration.is_initial_dump else _structures(target, operations)
+        steps[index] = replace(step, result=used, seconds=time.monotonic() - began, structures=structures)
+        done.append(steps[index])
 
 
-def mark_applied(settings: Settings, schema: Schema, environment: str, target: Target, name: str) -> None:
+def mark_applied(settings: Settings, schema: Schema, environment: str, target: Target, name: str) -> Step:
     """Record a migration the DBA team applied by hand. It must be the next pending one."""
     target.lock()
     steps = pending_steps(
@@ -555,3 +683,6 @@ def mark_applied(settings: Settings, schema: Schema, environment: str, target: T
     target.start(steps[0].migration, "manual")
     target.finish(steps[0].migration, "manual")
     logger.info("migration recorded as manually applied", extra={"schema": schema.label, "environment": environment, "migration": name})
+    target.save_snapshot(target.definitions())
+    operations = sqlplan.parse_operations(steps[0].migration.read())
+    return replace(steps[0], result="manual", structures=_structures(target, operations))

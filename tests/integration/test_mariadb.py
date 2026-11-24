@@ -267,3 +267,40 @@ def test_command_line_plan_deploy_and_status(repo: Repo, capsys: pytest.CaptureF
     assert f"success   {ADD_COLUMN}" in output and PASSWORD not in output
     assert cli.main([*base, "plan", *scope]) == 0
     assert "would apply 0 migration(s)" in capsys.readouterr().out
+
+
+def test_table_structure_snapshot_drift_and_leftovers(repo: Repo, root: object, capsys: pytest.CaptureFixture[str]):
+    from schemaops.reconcile import reconcile
+
+    live = target()
+    deploy(repo.settings, repo.schema, "dev", live)
+    repo.add("dev", ADD_COLUMN, ADD_COLUMN_SQL)
+    applied: list = []
+    deploy(repo.settings, repo.schema, "dev", live, applied=applied)
+    ((table, structure),) = applied[0].structures
+    assert table == "users" and structure.startswith("CREATE TABLE `users`") and "`display_name` varchar(64)" in structure
+    assert set(live.snapshot() or {}) == {"users", "orders"}
+    assert reconcile(repo.settings, repo.schema, "dev", live) == []
+
+    # Normal use (rows, auto-increment counters) is not drift.
+    sql(root, f"INSERT INTO {DATABASE}.users (email) VALUES ('a@example.com'), ('b@example.com')")
+    assert reconcile(repo.settings, repo.schema, "dev", live) == []
+
+    # Changes made behind the tool's back are.
+    sql(root, f"ALTER TABLE {DATABASE}.users ADD COLUMN hotfix INT NULL")
+    sql(root, f"CREATE TABLE {DATABASE}.scratch (id BIGINT UNSIGNED PRIMARY KEY)")
+    sql(root, f"CREATE TABLE {DATABASE}._orders_new (id BIGINT UNSIGNED PRIMARY KEY)")
+    sql(root, f"CREATE TRIGGER {DATABASE}.pt_osc_{DATABASE}_orders_ins AFTER INSERT ON {DATABASE}.orders FOR EACH ROW SET @x = 1")
+    findings = reconcile(repo.settings, repo.schema, "dev", live)
+    found = sorted((finding.kind, finding.message) for finding in findings)
+    assert [kind for kind, _message in found] == ["DRIFT", "DRIFT", "LEFTOVER", "LEFTOVER"]
+    changed = next(finding for finding in findings if "`users` was changed" in finding.message)
+    assert "+  `hotfix` int(11) DEFAULT NULL" in changed.detail
+    assert any("`scratch` exists but was not created by a migration" in message for _kind, message in found)
+    assert any("table `_orders_new`" in message for _kind, message in found)
+    assert any(f"trigger `pt_osc_{DATABASE}_orders_ins`" in message for _kind, message in found)
+    live.close()
+
+    scope = ["--root", str(repo.root), "reconcile", "--env", "dev", "--cluster", "itc", "--schema", DATABASE]
+    assert cli.main(scope) == 1
+    assert "DRIFT Table `users` was changed outside a migration." in capsys.readouterr().out

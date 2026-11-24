@@ -1,0 +1,27 @@
+# Shared by the main pipeline and by the generated per-cluster deployment pipelines.
+
+variables:
+  # Set SCHEMAOPS_IMAGE (project CI/CD variable) to "$CI_REGISTRY_IMAGE/runner:latest"
+  # once the build-image job has pushed it. Until then jobs install what they need.
+  SCHEMAOPS_IMAGE: python:3.12-slim
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  GIT_DEPTH: "0"
+
+default:
+  image: $SCHEMAOPS_IMAGE
+  before_script:
+    # A no-op on the prebuilt image.
+    - >
+      (command -v git > /dev/null && command -v pt-online-schema-change > /dev/null)
+      || (apt-get update -qq && apt-get install -y -qq --no-install-recommends git percona-toolkit > /dev/null)
+
+# One deployment job. SCHEMAOPS_ENV, SCHEMAOPS_CLUSTER and SCHEMAOPS_SINCE come from the job.
+.schemaops-deploy:
+  stage: deploy
+  interruptible: false
+  script:
+    - pip install --quiet .
+    - schemaops deploy --env "$SCHEMAOPS_ENV" --cluster "$SCHEMAOPS_CLUSTER" --changed-since "$SCHEMAOPS_SINCE"
+  # Exit code 3: stopped at a migration the DBA team must apply by hand.
+  allow_failure:
+    exit_codes: [3]

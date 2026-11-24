@@ -7,6 +7,8 @@
 /policy/            @your-group/dba-team
 /schemaops.yaml     @your-group/dba-team
 /.gitlab-ci.yml     @your-group/dba-team
+/ci/                @your-group/dba-team
+/Dockerfile         @your-group/dba-team
 /CODEOWNERS         @your-group/dba-team
 /pyproject.toml     @your-group/dba-team
 

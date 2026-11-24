@@ -4,7 +4,7 @@ import pytest
 
 from schemaops import cli, governance
 from schemaops.deploy import HistoryRow, TableFacts
-from schemaops.gitlab import MergeRequest
+from schemaops.gitlab import MergeRequest, Project
 from schemaops.repo import Migration
 
 from conftest import DUMP, Repo
@@ -273,3 +273,153 @@ def test_host_can_come_from_cluster_yaml_but_credentials_cannot(repo: Repo, monk
         handle.write("  uat: {host: db-uat.internal, password: hunter2}\n")
     assert run(repo, "validate") == 1
     assert "credentials must never be stored in Git" in capsys.readouterr().out
+
+
+# ------------------------------------------------ deployment jobs and reporting
+
+
+def fake_targets(monkeypatch: pytest.MonkeyPatch, targets: dict[str, object]) -> list[str]:
+    """Make the CLI use in-memory targets, and capture notifications."""
+    sent: list[str] = []
+    monkeypatch.setattr(cli, "_target", lambda settings, schema, environment, read_only=False: targets[schema.label])
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(cli.notify, "send", lambda text: sent.append(text) or True)
+    return sent
+
+
+def test_deploy_carries_on_past_a_failing_schema_and_notifies(git_repo: Repo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    from test_deploy import FakeTarget, done
+
+    other = Repo(git_repo.root, cluster="payments", schema="ledger")
+    other.add("dev", DUMP)
+    git_repo.add("dev", "2026-11-20_add_display_name.sql", ALTER)
+    other.add("dev", "2026-11-20_add_display_name.sql", ALTER)
+    broken = FakeTarget(tables=2, rows=done(other, "dev", DUMP), fail_on="display_name")
+    working = FakeTarget(tables=2, rows=done(git_repo, "dev", DUMP))
+    sent = fake_targets(monkeypatch, {"payments/ledger": broken, "trades/accounts": working})
+
+    assert run(git_repo, "deploy", "--env", "dev", "--all") == 1
+    assert working.rows["2026-11-20_add_display_name.sql"].status == "success"  # deployed despite the other failure
+    assert "trades/accounts (DEV): applied 1 migration(s)" in capsys.readouterr().out
+    assert len(sent) == 1 and "payments/ledger: FAILED" in sent[0] and "trades/accounts: applied 1 migration(s)" in sent[0]
+
+    # --cluster narrows --all to one cluster.
+    assert run(git_repo, "deploy", "--env", "dev", "--all", "--cluster", "trades") == 0
+
+
+def test_a_failure_is_never_reported_as_merely_waiting_for_the_dba(git_repo: Repo, monkeypatch: pytest.MonkeyPatch):
+    from test_deploy import FakeTarget, done
+
+    other = Repo(git_repo.root, cluster="payments", schema="ledger")
+    other.add("dev", DUMP)
+    other.add("dev", "2026-11-20_add_display_name.sql", ALTER)
+    git_repo.add("dev", "2026-11-20_unique_email.sql", "ALTER TABLE users ADD UNIQUE KEY uq_email (email);\n")
+    waiting = FakeTarget(tables=2, rows=done(git_repo, "dev", DUMP))
+    broken = FakeTarget(tables=2, rows=done(other, "dev", DUMP), fail_on="display_name")
+    fake_targets(monkeypatch, {"trades/accounts": waiting, "payments/ledger": broken})
+    assert run(git_repo, "deploy", "--env", "dev", "--all", "--cluster", "trades") == 3  # waiting only
+    assert run(git_repo, "deploy", "--env", "dev", "--all") == 1  # a failure outranks waiting
+
+
+def test_successful_deployment_posts_the_new_table_structure_on_its_merge_request(git_repo: Repo, monkeypatch: pytest.MonkeyPatch):
+    from test_deploy import FakeTarget, done
+
+    name = "2026-11-20_add_display_name.sql"
+    git_repo.add("dev", name, ALTER)
+    commit = git_repo.commit("add display name")
+    target = FakeTarget(tables=2, rows=done(git_repo, "dev", DUMP))
+    target.instant = True
+    fake_targets(monkeypatch, {"trades/accounts": target})
+    monkeypatch.setenv("CI_API_V4_URL", "https://gitlab.example.com/api/v4")
+    monkeypatch.setenv("CI_PROJECT_ID", "42")
+    monkeypatch.setenv("SCHEMAOPS_GITLAB_TOKEN", "glpat-secret-token")
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_call(self, suffix, method="GET", payload=None):  # noqa: ANN001, ANN202
+        calls.append((method, suffix, (payload or {}).get("body", "")))
+        return [{"iid": 17}] if "merge_requests" in suffix and method == "GET" else {}
+
+    monkeypatch.setattr(Project, "_call", fake_call)
+    assert run(git_repo, "deploy", "--env", "dev", "--all") == 0
+    assert ("GET", f"/repository/commits/{commit}/merge_requests", "") in calls
+    (posted,) = [(suffix, body) for method, suffix, body in calls if method == "POST"]
+    assert posted[0] == "/merge_requests/17/notes"
+    assert posted[1].startswith("### schemaops: deployed to DEV")
+    assert f"**trades/accounts** `{name}`: instant DDL in 0s" in posted[1]
+    assert "Table `users` is now:" in posted[1] and "```sql\nCREATE TABLE `users` (id) + ADD COLUMN display_name" in posted[1]
+
+    calls.clear()
+    assert run(git_repo, "deploy", "--env", "dev", "--all") == 0  # nothing applied: nothing posted
+    assert calls == []
+
+
+def test_reconcile_command_reports_and_fails_only_when_something_is_wrong(git_repo: Repo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]):
+    from test_deploy import FakeTarget, done
+
+    target = FakeTarget(tables=2, rows=done(git_repo, "dev", DUMP))
+    target.saved = dict(target.ddl)
+    sent = fake_targets(monkeypatch, {"trades/accounts": target})
+    assert run(git_repo, "reconcile", "--env", "dev", "--all") == 0
+    assert "0 finding(s)" in capsys.readouterr().out and sent == []
+
+    git_repo.add("dev", "2026-11-20_add_display_name.sql", ALTER)
+    target.ddl["users"] += " + hotfix"
+    assert run(git_repo, "reconcile", "--env", "dev", "--all") == 1
+    output = capsys.readouterr().out
+    assert "trades/accounts: PENDING `2026-11-20_add_display_name.sql`" in output
+    assert "trades/accounts: DRIFT Table `users` was changed outside a migration." in output
+    assert len(sent) == 1 and "2 finding(s)" in sent[0]
+    assert target.calls == [] and target.rows.keys() == {DUMP}  # read-only
+
+
+def test_pipeline_command_writes_one_deployment_job_per_changed_cluster(git_repo: Repo, tmp_path: Path):
+    import yaml
+
+    base = git_repo.commit()
+    other = Repo(git_repo.root, cluster="payments", schema="ledger")
+    other.add("dev", DUMP)
+    git_repo.add("dev", "2026-11-20_add_display_name.sql", ALTER)
+    git_repo.commit("two clusters changed")
+    output = tmp_path / "child.yml"
+    assert run(git_repo, "pipeline", "--env", "dev", "--changed-since", base, "--output", str(output)) == 0
+    child = yaml.safe_load(output.read_text())
+    assert child["include"] == [{"local": "ci/common.yml"}]
+    assert set(child) - {"include", "stages"} == {"deploy-payments-dev", "deploy-trades-dev"}
+    job = child["deploy-trades-dev"]
+    assert job["extends"] == ".schemaops-deploy" and job["environment"] == "dev"
+    assert job["resource_group"] == "schemaops-trades-dev"
+    assert job["variables"] == {"SCHEMAOPS_ENV": "dev", "SCHEMAOPS_CLUSTER": "trades", "SCHEMAOPS_SINCE": base}
+
+    assert run(git_repo, "pipeline", "--env", "dev", "--changed-since", "HEAD", "--output", str(output)) == 0
+    assert "nothing-to-deploy" in yaml.safe_load(output.read_text())  # a child pipeline needs at least one job
+
+
+def test_notifications_are_optional_and_never_raise(monkeypatch: pytest.MonkeyPatch):
+    import urllib.error
+
+    from schemaops import notify
+
+    monkeypatch.delenv("SCHEMAOPS_NOTIFY_WEBHOOK", raising=False)
+    assert notify.send("hello") is False
+    monkeypatch.setenv("SCHEMAOPS_NOTIFY_WEBHOOK", "https://hooks.example.com/services/T000/SECRET")
+    seen: list[bytes] = []
+
+    class Response:
+        def __enter__(self):  # noqa: ANN204
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def fake_urlopen(request, timeout=0):  # noqa: ANN001, ANN202
+        seen.append(request.data)
+        return Response()
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", fake_urlopen)
+    assert notify.send("deployed") is True and b"deployed" in seen[0]
+
+    def broken(request, timeout=0):  # noqa: ANN001, ANN202
+        raise urllib.error.URLError("no route")
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", broken)
+    assert notify.send("deployed") is False

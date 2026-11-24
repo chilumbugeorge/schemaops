@@ -88,3 +88,51 @@ class MergeRequest:
         """User names of everyone who has approved the merge request."""
         approved = self._get("/approvals").get("approved_by") or []
         return {str(entry.get("user", {}).get("username", "")) for entry in approved if isinstance(entry, dict)}
+
+
+@dataclass(frozen=True)
+class Project:
+    """The GitLab project, for pipelines that do not run inside a merge request."""
+
+    api_url: str
+    project_id: str
+    token: str
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> Project | None:
+        env = os.environ if environ is None else environ
+        token = env.get("SCHEMAOPS_GITLAB_TOKEN", "")
+        log.register_secret(token)
+        if not (token and env.get("CI_API_V4_URL") and env.get("CI_PROJECT_ID")):
+            return None
+        return cls(env["CI_API_V4_URL"], env["CI_PROJECT_ID"], token)
+
+    def _call(self, suffix: str, method: str = "GET", payload: dict[str, str] | None = None) -> Any:
+        body = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"PRIVATE-TOKEN": self.token, "Content-Type": "application/json"}
+        request = urllib.request.Request(
+            f"{self.api_url}/projects/{self.project_id}{suffix}", data=body, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310 - GitLab API URL
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise GovernanceError(f"GitLab API request failed: {log.redact(str(exc))}") from exc
+
+    def merge_requests_for_commit(self, sha: str) -> list[str]:
+        """IIDs of the merge requests that brought a commit to the default branch. Never raises."""
+        try:
+            found = self._call(f"/repository/commits/{sha}/merge_requests")
+        except GovernanceError as exc:
+            logger.warning("could not look up the merge request", extra={"commit": sha[:12], "reason": str(exc)})
+            return []
+        return [str(entry["iid"]) for entry in found if isinstance(entry, dict) and "iid" in entry] if isinstance(found, list) else []
+
+    def comment(self, iid: str, body: str) -> bool:
+        """Add a comment to a merge request. Never raises."""
+        try:
+            self._call(f"/merge_requests/{iid}/notes", "POST", {"body": body})
+            return True
+        except GovernanceError as exc:
+            logger.warning("could not comment on the merge request", extra={"merge_request": iid, "reason": str(exc)})
+            return False
